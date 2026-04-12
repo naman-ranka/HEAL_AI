@@ -1,12 +1,26 @@
 # HEAL.AI — Claude Context
 
 ## Project Overview
-HEAL.AI is a healthcare financial assistant: upload an insurance policy → AI extracts coverage → upload a medical bill → AI cross-references for errors, discrepancies, and patient responsibility.
 
-**2nd place winner — Devlabs Hackathon.**
+**HEAL AI is a healthcare financial advocate that lives in Slack.**
 
-Current active branch: `hackathon-thinkn-uchenova`
-Goal: Win two hackathon tracks by integrating a Slack bot with the Thinkn Beliefs SDK.
+The problem: 1 in 3 American medical bills contains errors. Most patients don't understand their EOB, can't tell when they're overcharged, and have no idea how to dispute. HEAL fixes this — entirely inside the tools people already use at work and school.
+
+Upload your insurance policy → AI extracts all your coverage details.
+Upload a medical bill → AI cross-references for billing errors, flags overcharges, and drafts a formal dispute letter. Ask anything → plain-English answers about copays, deductibles, what's covered.
+
+**Awards:** 2nd place — Devlabs Hackathon.
+
+**Current branch:** `hackathon-thinkn-uchenova`
+**Goal:** Win two additional hackathon tracks (Thinkn + UcheNova) via the Slack bot.
+
+### What makes it different
+
+- **No new tab needed.** The entire experience is a Slack DM. Employees/students can use it without leaving their workflow.
+- **Real data, not hallucinations.** Nearby hospitals come from OpenStreetMap (Overpass API), not Gemini speculation.
+- **Persistent memory.** The Thinkn `beliefs` SDK builds a per-user knowledge graph. After one conversation, HEAL remembers your policy, conditions, and history — across restarts.
+- **Dispute in one click.** After finding billing errors, users can send a formal dispute letter to the billing department directly from Slack with one command.
+- **Calendar invites.** Book a campus health center appointment and get a `.ics` file in your inbox, pre-filled with your insurance details.
 
 ---
 
@@ -73,22 +87,26 @@ frontend-clean/            ← React + TypeScript + Vite frontend
 
 ## Fixed Bugs (as of 2026-04-12)
 
-All prior bugs resolved. Current state of `heal-slack-bot/app.js`:
+All bugs resolved. Current state of `heal-slack-bot/app.js`:
 - Per-user beliefs isolation via `thread: userId` in `mkB()` ✓
-- `beliefs.search()` used in `resolvePolicyId()` for state recovery ✓
+- `beliefs.search()` used in `resolvePolicyId()` for state recovery after restart ✓
 - `beliefs.before()` removed (was unused) ✓
 - `document_processor.py` fallback dim is 768 ✓
 - `embedder.py:303` `initialize_embedder` default fixed to `text-embedding-004` ✓
 - State persisted to `bot-state.json` via `state.js` (survives restarts) ✓
-- `docId = 'latest'` fallback removed — now throws if ID can't be determined ✓
+- `docId = 'latest'` fallback removed — throws if ID can't be determined ✓
 - Beliefs `after()` receives clean AI text, not Slack-formatted string ✓
 - Event dedup Set prevents socket replay ✓
+- Stale session auto-retry — if backend restarts, `handleRagChat` creates a new session and retries ✓
+- Appointment state cleanup — `_aptStep`/`_apt` deleted before `finishAppointment` (reason path) ✓
+- University sanitized at input time — `sanitizeUni()` applied before `setProfile` in profile step ✓
+- "hospitals in Sacramento" → OSM — `extractLocationFromText` + `MEDICAL_FACILITY_RE` routing ✓
+- `bot-state.json` gitignored — contains user PII, was previously tracked ✓
+- `.env.example` files added for both `heal-slack-bot/` and `backend/` ✓
 
 ## Open TODOs
 
 - Startup cleanup of orphaned "Thinking..." placeholder messages (post-hackathon)
-- Session retry on stale sessionId: if `/chat/sessions/{id}/messages` returns 4xx,
-  clear sessionId and retry with a new session
 
 ---
 

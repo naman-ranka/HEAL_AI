@@ -169,16 +169,24 @@ app.message(async ({ message, client }) => {
     processed.add(message.ts);
     if (processed.size > 1000) processed.clear();
 
-    // Eagerly fetch + cache the user's Slack email (once per user, silently skipped if scope missing)
-    if (!getProfile(userId).email) {
+    // Eagerly enrich the user profile from Slack metadata (once per user).
+    // Uses the slackEnriched flag so re-enrichment happens if any field was added
+    // after the user's profile was first created (e.g. timezone added in a later deploy).
+    // Fetches: email, first name, real name, timezone offset.  Zero extra API calls —
+    // all fields come from the single users.info call we were already making.
+    if (!getProfile(userId).slackEnriched) {
         try {
-            const userInfo = await client.users.info({ user: userId });
-            const slackEmail = userInfo?.user?.profile?.email;
-            if (slackEmail) {
-                setProfile(userId, { email: slackEmail });
-                console.log(`[slack-email] cached ${slackEmail} for ${userId}`);
-            }
-        } catch { /* users:read.email scope not granted — skip */ }
+            const userInfo  = await client.users.info({ user: userId });
+            const u         = userInfo?.user;
+            const patch     = { slackEnriched: true };
+            if (u?.profile?.email)      patch.email          = u.profile.email;
+            if (u?.profile?.first_name) patch.firstNameSlack = u.profile.first_name;
+            if (u?.real_name)           patch.realNameSlack  = u.real_name;
+            if (u?.tz_offset != null)   patch.tzOffset       = u.tz_offset;   // seconds from UTC
+            if (u?.tz)                  patch.tz             = u.tz;           // e.g. "America/Phoenix"
+            setProfile(userId, patch);
+            console.log(`[slack-enrich] ${userId} name="${patch.firstNameSlack}" tz="${patch.tz}" email="${patch.email}"`);
+        } catch { /* users:read / users:read.email scope not granted — skip */ }
     }
 
     console.log(`[msg] user=${userId} text="${text.slice(0,80)}"`);
@@ -285,7 +293,8 @@ app.message(async ({ message, client }) => {
                 // ── Personalised returning-user greeting ──────────────────────
                 const profile  = getProfile(userId);
                 const lastBill = state[`${userId}_lastBill`] || null;
-                const firstName = profile.patientName?.split(' ')[0];
+                // Prefer insurance policy name; fall back to Slack profile first name
+                const firstName = profile.patientName?.split(' ')[0] || profile.firstNameSlack;
 
                 let greet = `👋 *Hey${firstName ? ` ${firstName}` : ''}!* Welcome back to HEAL.\n\n`;
 
@@ -313,10 +322,11 @@ app.message(async ({ message, client }) => {
                 await client.chat.postMessage({ channel, text: greet });
             } else {
                 // ── First-time onboarding ──────────────────────────────────────
+                const newUserName = getProfile(userId).firstNameSlack;
                 await client.chat.postMessage({
                     channel,
                     text:
-                        "👋 *Hi! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n" +
+                        `👋 *Hi${newUserName ? ` ${newUserName}` : ''}! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n` +
                         "*What I can do:*\n" +
                         "• 📋 Explain your insurance coverage in plain English\n" +
                         "• 🏥 Find nearby in-network hospitals, urgent care & specialists\n" +
@@ -632,8 +642,49 @@ const SEARCH_INTENT = /near(by| me| my|est)|\bfind (a|me|the|an?)\b|\bshow me\b|
 // Queries that need location context → contextual endpoint (coverage questions that mention location)
 const LOCATION_INTENT = /hospital|clinic|urgent care|er\b|emergency room|doctor|specialist|physician|provider|dentist|pharmacy|near(by)?|close to|in my area|find a|where (can|do|should)|covered (near|in)/i;
 
-// Queries that are clearly asking for medical advice (hard block)
-const MEDICAL_ADVICE_INTENT = /should i take|diagnos|prescri|my symptom|do i have|is it (serious|cancer|covid|flu)|what (disease|condition)|treat(ment)? for/i;
+// Queries that are clearly asking for medical advice (hard block).
+// "do i have" stays here to catch "do I have diabetes?" — the COVERAGE_QUERY guard
+// at the call site prevents false positives like "do I have dental coverage."
+const MEDICAL_ADVICE_INTENT = /should i take|diagnos|prescri|my symptom|\bdo i have\b|is it (serious|cancer|covid|flu)|what (disease|condition)|treat(ment)? for/i;
+
+// Medical facility types — used to detect "hospitals in X" style queries
+const MEDICAL_FACILITY_RE = /\b(hospital|clinic|urgent care|er\b|emergency room|doctor|specialist|dentist|pharmacy|provider)\b/i;
+
+/**
+ * Extract an explicit city/location from query text like "hospitals in Salt Lake City"
+ * or "find a doctor near Austin, TX".
+ *
+ * Returns null when no named location is found (i.e. user just said "near me").
+ * Filters out pronouns and vague words ("me", "here", "my area", "network", "plan").
+ */
+function extractLocationFromText(text) {
+    // Vague words that look like locations but aren't place names
+    const NOT_PLACE = /^(me|here|the|a|an|my|your|this|that|there|anywhere|somewhere|any|network|plan|area|home|work)$/i;
+
+    // Match "in/near/around/at <Location Name>" — up to 4 words
+    const m = text.match(/\b(?:in|near|around|at)\s+((?:[A-Za-z][A-Za-z'-]*(?:\s+|,\s*)?){1,4})/);
+    if (!m) return null;
+
+    // Strip trailing punctuation and comma-only tails
+    let candidate = m[1].trim().replace(/[,.\s]+$/, '');
+    if (!candidate) return null;
+
+    const firstWord = candidate.split(/[\s,]+/)[0];
+
+    // Reject if it starts with a non-place word
+    if (NOT_PLACE.test(firstWord)) return null;
+
+    // Reject phrases like "my network", "the plan", "in-network"
+    if (/^(network|plan|my|the|a|an|this|your|in-network)/i.test(candidate)) return null;
+
+    return candidate;
+}
+
+// Signals the user is asking about their insurance/coverage (not medical advice).
+// Used to prevent false-positive MEDICAL_ADVICE_INTENT blocks on coverage questions.
+// Note: no trailing \b — "insurance", "coinsurance" etc. contain substrings that
+// would fail a trailing word-boundary check if abbreviated.
+const COVERAGE_QUERY = /\b(coverage|covered|covers?|insurance|insured|insurer|policy|benefits?|copay|deductible|in-network|out.of.pocket|out.of.network|premium|coinsurance|plan|dental|vision|mental.health|prescription|formulary)/i;
 
 // Appointment booking intent
 const APPOINTMENT_INTENT = /book|schedule|appointment|appt|campus (health|clinic)|health center|make an? (appointment|booking)/i;
@@ -739,7 +790,10 @@ async function handleChat(userId, text) {
             return `🎓 Got it! What's the *name* of your university?\n_(e.g. "Arizona State University")_\n\n_Type "skip" if you're not a student or prefer not to say._`;
         }
         if (!/^skip$/i.test(uniInput)) {
-            const uni = uniInput;
+            // Sanitize before storing — strips "yes, X" prefix so profile doesn't
+            // end up as "yes, Arizona State". Falls back to raw input if sanitize
+            // can't extract anything (shouldn't happen after the isVague check above).
+            const uni = sanitizeUni(uniInput) || uniInput;
             setProfile(userId, { university: uni });
             bgB(userId, b => b.add([
                 { text: `Student at ${uni}`, confidence: 0.95, type: 'evidence', source: 'user' }
@@ -782,9 +836,18 @@ async function handleChat(userId, text) {
 // ── Date/time parser for appointment booking ─────────────────────────────────
 // Returns { iso, display } on success, null if the input is too ambiguous.
 // Stores ISO string so generateICS always gets a clean Date — no more guessing.
+//
+// tzOffsetSeconds: user's UTC offset in seconds (from profile.tzOffset).
+// Used to calculate "user-local now" so past-date detection is correct when the
+// server runs in a different timezone than the user (e.g. server=UTC, user=UTC-7).
 
-function tryParseDateTime(raw) {
-    const now = new Date();
+function tryParseDateTime(raw, tzOffsetSeconds = null) {
+    // "now" from the user's perspective.
+    // If tzOffset is available, shift: userNow = serverNow + (userOffset - serverOffset)
+    const serverNow = new Date();
+    const now = tzOffsetSeconds != null
+        ? new Date(serverNow.getTime() + (tzOffsetSeconds - (-serverNow.getTimezoneOffset() * 60)) * 1000)
+        : serverNow;
     const yr  = now.getFullYear();
 
     // Helper: build a { iso, display, date } result from a resolved Date
@@ -910,6 +973,41 @@ async function startAppointment(userId) {
     );
 }
 
+// Shared appointment completion — called once all required fields are known.
+// Extracted so both the 'reason' step (email already on file) and the 'email'
+// step (email just collected) can reach the same finish without code duplication.
+async function finishAppointment(userId, apt, profile) {
+    const uni       = sanitizeUni(apt.university) || sanitizeUni(profile.university) || null;
+    const aptMerged = { ...apt, ...profile, university: uni };
+    const calLink   = makeCalendarLink(aptMerged);
+    const uniHealth = uni ? `${uni} Health Center` : 'Campus Health Center';
+
+    let emailNote = '';
+    const toEmail = profile.email;
+    if (toEmail && isEmailConfigured()) {
+        try {
+            await sendCalendarInvite({ to: toEmail, ...aptMerged });
+            emailNote = `\n\n📧 *Calendar invite sent to* ${toEmail}`;
+        } catch (err) {
+            console.error('[calendar-email]', err.message);
+            emailNote = `\n\n⚠️ _Couldn't send calendar email: ${err.message}_`;
+        }
+    }
+
+    return (
+        `📅 *Appointment Request Ready!*\n\n` +
+        `*Location:* ${uniHealth}\n` +
+        `*Patient:* ${apt.name}\n` +
+        `*Phone:* ${apt.phone}\n` +
+        `*Insurance:* ${apt.insuranceName || 'On file'} (${apt.insuranceNumber || 'see policy'})\n` +
+        `*Conditions:* ${apt.conditions || profile.conditions || 'None reported'}\n` +
+        `*Date/Time:* ${apt.datetimeDisplay || apt.datetime}\n` +
+        `*Reason:* ${apt.reason}\n\n` +
+        `👉 <${calLink}|*Add to Google Calendar*>` +
+        emailNote
+    );
+}
+
 async function handleAppointmentStep(userId, text) {
     const aptStep = state[`${userId}_aptStep`];
     const apt     = state[`${userId}_apt`] || {};
@@ -936,7 +1034,7 @@ async function handleAppointmentStep(userId, text) {
     }
 
     if (aptStep === 'datetime') {
-        const parsed = tryParseDateTime(text.trim());
+        const parsed = tryParseDateTime(text.trim(), profile.tzOffset ?? null);
         if (!parsed) {
             // Don't advance the step — ask again with a clear example
             return (
@@ -961,45 +1059,61 @@ async function handleAppointmentStep(userId, text) {
 
     if (aptStep === 'reason') {
         apt.reason = text.trim();
-        // Clear booking state
+        state[`${userId}_apt`] = apt;
+
+        // Gap check: if no email on file, pause and ask before finalising.
+        // Without it we can't send the .ics invite, and we know they'll want one.
+        if (!profile.email && isEmailConfigured()) {
+            state[`${userId}_aptStep`] = 'email';
+            saveState(state);
+            return (
+                `✅ *Reason:* ${apt.reason} ✓\n\n` +
+                `Almost done! To send you a *calendar invite (.ics)* I need your email.\n\n` +
+                `*What's your email address?*\n` +
+                `_(e.g. "you@email.com" — type "skip" to skip the invite)_`
+            );
+        }
+
+        // Email already on file — clean up state BEFORE calling finishAppointment.
+        // If we don't delete here, the next user message would re-enter handleAppointmentStep
+        // with aptStep='reason' and treat it as a new appointment request.
         delete state[`${userId}_aptStep`];
         delete state[`${userId}_apt`];
         saveState(state);
+        return await finishAppointment(userId, apt, profile);
+    }
 
-        // Sanitize university (reuses top-level sanitizeUni — strips "yes", "yes, X" prefix, etc.)
-        const uni = sanitizeUni(apt.university) || sanitizeUni(profile.university) || null;
-        const aptMerged = { ...apt, ...profile, university: uni };
-
-        const calLink   = makeCalendarLink(aptMerged);
-        const uniHealth = uni ? `${uni} Health Center` : 'Campus Health Center';
-
-        // Send .ics calendar invite via email if we have the user's email
-        const toEmail = profile.email;
-        let emailNote = '';
-        if (toEmail && isEmailConfigured()) {
-            try {
-                await sendCalendarInvite({ to: toEmail, ...aptMerged });
-                emailNote = `\n\n📧 *Calendar invite sent to* ${toEmail}`;
-            } catch (err) {
-                console.error('[calendar-email]', err.message);
-                emailNote = `\n\n⚠️ _Couldn't send calendar email: ${err.message}_`;
-            }
-        } else if (!toEmail) {
-            emailNote = `\n\n_ℹ️ No email on file — click the link above to add it to your calendar manually._`;
+    if (aptStep === 'email') {
+        // User is providing their email so we can send the calendar invite
+        if (/^skip$/i.test(text.trim())) {
+            // They chose to skip — complete without email
+            delete state[`${userId}_aptStep`];
+            const savedApt = state[`${userId}_apt`] || apt;
+            delete state[`${userId}_apt`];
+            saveState(state);
+            return await finishAppointment(userId, savedApt, profile);
         }
 
-        return (
-            `📅 *Appointment Request Ready!*\n\n` +
-            `*Location:* ${uniHealth}\n` +
-            `*Patient:* ${apt.name}\n` +
-            `*Phone:* ${apt.phone}\n` +
-            `*Insurance:* ${apt.insuranceName || 'On file'} (${apt.insuranceNumber || 'see policy'})\n` +
-            `*Conditions:* ${apt.conditions || profile.conditions || 'None reported'}\n` +
-            `*Date/Time:* ${apt.datetimeDisplay || apt.datetime}\n` +
-            `*Reason:* ${apt.reason}\n\n` +
-            `👉 <${calLink}|*Add to Google Calendar*>` +
-            emailNote
-        );
+        const emailMatch = text.trim().match(/[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}/);
+        if (!emailMatch) {
+            // Invalid format — re-ask, don't advance
+            return (
+                `📧 That doesn't look like a valid email address. Try again:\n` +
+                `_(e.g. "you@example.com" — or type "skip" to skip the invite)_`
+            );
+        }
+
+        const captured = emailMatch[0].toLowerCase();
+        setProfile(userId, { email: captured });
+        bgB(userId, b => b.add([
+            { text: `User email is ${captured}`, confidence: 1.0, type: 'evidence', source: 'user' }
+        ]));
+
+        delete state[`${userId}_aptStep`];
+        const savedApt = state[`${userId}_apt`] || apt;
+        delete state[`${userId}_apt`];
+        saveState(state);
+        return await finishAppointment(userId, savedApt, getProfile(userId));  // re-fetch profile with new email
     }
 
     // Unknown step — reset gracefully
@@ -1045,12 +1159,48 @@ async function handleEmailStep(userId, text) {
     const profile   = getProfile(userId);
     const bill      = state[`${userId}_lastBill`] || {};
 
+    if (emailStep === 'capture_email') {
+        // User typed "me" but had no email on file — we asked for it, this is the reply
+        if (/^skip$/i.test(text.trim())) {
+            // They don't want to give email — fall back to bot Gmail with a note
+            state[`${userId}_emailStep`] = 'to';
+            saveState(state);
+            return await handleEmailStep(userId, process.env.GMAIL_USER || '');
+        }
+        const emailMatch = text.trim().match(/[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}/);
+        if (!emailMatch) {
+            return (
+                `📧 That doesn't look like a valid email. Try again:\n` +
+                `_(e.g. "you@example.com" — or type "skip" to send to the bot's Gmail)_`
+            );
+        }
+        const captured = emailMatch[0].toLowerCase();
+        setProfile(userId, { email: captured });
+        bgB(userId, b => b.add([
+            { text: `User email is ${captured}`, confidence: 1.0, type: 'evidence', source: 'user' }
+        ]));
+        // Continue with the now-known email address
+        state[`${userId}_emailStep`] = 'to';
+        saveState(state);
+        return await handleEmailStep(userId, captured);
+    }
+
     if (emailStep === 'to') {
         const rawTo = text.trim();
-        // "me" → use the user's cached Slack email, then fall back to the bot's own Gmail address
-        const to = rawTo.toLowerCase() === 'me'
-            ? (profile.email || process.env.GMAIL_USER)
-            : rawTo;
+
+        // "me" with no email → ask for it first rather than silently using bot's Gmail
+        if (rawTo.toLowerCase() === 'me' && !profile.email) {
+            state[`${userId}_emailStep`] = 'capture_email';
+            saveState(state);
+            return (
+                `📧 To send it to yourself I need your email address.\n\n` +
+                `*What's your email?*\n` +
+                `_(e.g. "you@example.com" — type "skip" to use the bot's Gmail as a fallback)_`
+            );
+        }
+
+        // "me" with email on file, or explicit address
+        const to = rawTo.toLowerCase() === 'me' ? profile.email : rawTo;
 
         const draft = {
             to,
@@ -1157,8 +1307,11 @@ async function routeChat(userId, text, policyId) {
         return await handleHealthProfile(userId);
     }
 
-    // Hard block: medical advice
-    if (MEDICAL_ADVICE_INTENT.test(text)) {
+    // Hard block: medical advice.
+    // Skip the block if the message is clearly about insurance/coverage — "do I have
+    // dental coverage" and "is my prescription covered" are coverage questions, not
+    // requests for medical diagnosis or treatment advice.
+    if (MEDICAL_ADVICE_INTENT.test(text) && !COVERAGE_QUERY.test(text)) {
         return (
             `⚠️ *I can't provide medical advice, diagnoses, or treatment recommendations.*\n\n` +
             `If this is an emergency, call *911* immediately.\n\n` +
@@ -1168,8 +1321,17 @@ async function routeChat(userId, text, policyId) {
     }
 
     // Real-world provider search → OpenStreetMap (not Gemini hallucination)
-    if (SEARCH_INTENT.test(text)) {
-        if (!profile.location) {
+    //
+    // Two triggers:
+    //  1. Standard SEARCH_INTENT ("find a hospital near me", "hospitals near Phoenix")
+    //  2. Explicit named city + medical facility type ("hospitals in Salt Lake City",
+    //     "doctors in Austin TX") — this catches queries that don't match SEARCH_INTENT
+    //     but clearly want a real-world result, not a RAG/policy answer.
+    const explicitSearchLoc = extractLocationFromText(text);
+    if (SEARCH_INTENT.test(text) || (MEDICAL_FACILITY_RE.test(text) && explicitSearchLoc)) {
+        // handleProviderSearch now resolves location internally (explicit > profile)
+        // so we only need to gate on "no location at all" here.
+        if (!profile.location && !explicitSearchLoc) {
             // Queue the question, collect location first
             state[`${userId}_profileStep`] = 'location';
             state[`${userId}_queued`]      = text;
@@ -1188,8 +1350,40 @@ async function routeChat(userId, text, policyId) {
         return await handleContextualChat(userId, text, profile, policyId);
     }
 
-    // Standard RAG for policy/coverage questions
-    return await handleRagChat(userId, text);
+    // Standard RAG for policy/coverage questions.
+    // After answering, append a one-line gap hint if critical info is missing and
+    // would meaningfully improve future interactions.  One hint at a time — not a
+    // nag list.  Only appended on the standard RAG path (not on location/search/
+    // appointment flows which already ask for what they need inline).
+    const ragReply = await handleRagChat(userId, text);
+    const hint = gapHint(profile, text);
+    return hint ? `${ragReply}\n\n${hint}` : ragReply;
+}
+
+/**
+ * Returns a single contextually relevant tip when a critical profile field is
+ * missing and the user's question suggests they would benefit from it.
+ * Returns null when nothing useful to say.
+ */
+function gapHint(profile, text) {
+    const lc = text.toLowerCase();
+
+    // No email and they're asking about appointments, billing, or sending things
+    if (!profile.email && /appoint|book|invite|calendar|dispute|letter|send|email/i.test(lc)) {
+        return `_💡 Tip: Tell me your email (\`my email is you@example.com\`) and I'll send calendar invites and dispute letters directly to you._`;
+    }
+
+    // No location and they asked something that mentions hospitals, doctors, or nearby
+    if (!profile.location && /hospital|clinic|doctor|specialist|urgent care|near|provider/i.test(lc)) {
+        return `_💡 Tip: Tell me your city (\`I'm in Phoenix, AZ\`) and I can show real nearby providers._`;
+    }
+
+    // No university and they asked about campus health, student, or campus
+    if (!sanitizeUni(profile.university) && /campus|student|university|college|health cent/i.test(lc)) {
+        return `_💡 Tip: Tell me your university and I'll tailor campus health center appointments for you._`;
+    }
+
+    return null;
 }
 
 async function handleContextualChat(userId, text, profile, policyId) {
@@ -1305,10 +1499,29 @@ function formatHospitalResults(hospitals, location, insuranceName) {
 }
 
 async function handleProviderSearch(userId, text, profile) {
-    const location      = profile.location;
+    // Prefer an explicitly named city/location in the query ("hospitals in Salt Lake City")
+    // over the stored profile location.  Falls back to profile.location for "near me" queries.
+    const explicitLoc   = extractLocationFromText(text);
+    const location      = explicitLoc || profile.location;
     const insuranceName = profile.insuranceName || '';
     const wantsDentist  = /dentist|dental/i.test(text);
     const radiusMeters  = 15000; // ~9 miles
+
+    if (!location) {
+        // Neither explicit city in query nor profile location — ask
+        state[`${userId}_profileStep`] = 'location';
+        state[`${userId}_queued`]      = text;
+        saveState(state);
+        return (
+            `📍 To find nearby providers I need your location.\n\n` +
+            `*What city and state are you in?*\n` +
+            `_(e.g. "Phoenix, AZ" — or type "skip" for a Google Maps link)_`
+        );
+    }
+
+    if (explicitLoc) {
+        console.log(`[hospital-search] using explicit location "${explicitLoc}" (profile: "${profile.location || 'none'}")`);
+    }
 
     try {
         const hospitals = await searchNearbyHospitals(location, radiusMeters, wantsDentist ? 'dentist' : null);
@@ -1458,12 +1671,15 @@ async function handleRagChat(userId, text) {
         });
     }
 
-    // Create a session if we don't have one
+    // Create a session if we don't have one.
+    // Sessions are in-memory only — NOT persisted to bot-state.json.
+    // They recreate lazily on restart. The stale-session retry below handles
+    // the case where the backend restarted and its session table was cleared.
     async function newSession() {
         const { data } = await api.post('/chat/sessions', { document_ids: [policyId] });
         const sid = data.session_id;
         state[`${userId}_session`] = sid;
-        saveState(state);
+        // Do NOT call saveState() here — sessions are transient
         return sid;
     }
 

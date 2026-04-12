@@ -264,6 +264,13 @@ Thumbs.db
 *.sqlite3
 heal.db
 
+# Slack bot runtime state (contains user PII — never commit)
+heal-slack-bot/bot-state.json
+heal-slack-bot/bot-state.json.tmp
+
+# Temp upload files from bot
+heal-slack-bot/tmp_*
+
 # Uploaded files
 uploads/
 documents/

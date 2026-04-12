@@ -2,12 +2,21 @@
 
 ## What this is
 
-A Slack bot (Node.js, `@slack/bolt` v4, socket mode) that acts as a healthcare financial
-advocate. Users upload insurance policies and medical bills; the bot cross-references them
-for errors, answers coverage questions via RAG, finds nearby hospitals, books campus health
-center appointments, and sends formal billing dispute letters by email.
+HEAL AI is a healthcare financial advocate that lives inside Slack. Users upload their
+insurance policy and medical bills; HEAL cross-references them for billing errors, answers
+coverage questions via RAG, finds nearby hospitals in any city, books campus health center
+appointments with real calendar invites, and sends formal billing dispute letters by email.
 
-Talks to the HEAL FastAPI backend at `http://localhost:8000` via axios.
+**Hackathon context:** 2nd place — Devlabs Hackathon. Competing in two additional tracks:
+- **Thinkn** ($300) — best use of the `beliefs` npm SDK for agent memory
+- **UcheNova** ($400) — silent Slack integration solving real healthcare pain points
+
+**The problem:** Medical billing errors affect 1 in 3 Americans. Most people can't decode
+their EOB, don't know when they're overcharged, and have no idea how to dispute. HEAL
+makes the whole process as simple as sending a Slack message.
+
+**Stack:** Node.js · `@slack/bolt` v4 · socket mode · `beliefs` SDK · FastAPI backend (`:8000`)
+· Google Gemini (embeddings + analysis) · SQLite · OpenStreetMap/Overpass for real provider data
 
 ---
 
@@ -15,11 +24,12 @@ Talks to the HEAL FastAPI backend at `http://localhost:8000` via axios.
 
 | File | Purpose |
 |------|---------|
-| `app.js` | Everything — message handler, all flows, all helpers (~1400 lines) |
+| `app.js` | Everything — message handler, all flows, all helpers (~1700 lines) |
 | `email.js` | Nodemailer: `sendDisputeLetter`, `sendCalendarInvite`, `generateICS`, `previewLetter` |
 | `state.js` | `loadState()` / `saveState()` — atomic JSON write to `bot-state.json` |
-| `bot-state.json` | Persisted state (policyId + profile per user, survives restarts) |
+| `bot-state.json` | **Runtime only, gitignored** — persisted state (policyId + profile per user) |
 | `.env` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `HEAL_BACKEND_URL`, `BELIEFS_KEY`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` |
+| `.env.example` | Template — copy to `.env` and fill in keys |
 
 ---
 
@@ -34,10 +44,10 @@ Lives in memory, persisted to `bot-state.json` via `saveState()`. Keyed by userI
 | `state[userId + '_profile']` | `object` | User profile — see Profile fields below |
 | `state[userId + '_lastBill']` | `object` | `{ discrepancies, totalOvercharge, correctOwed, billedAmount }` |
 | `state[userId + '_apt']` | `object` | In-progress appointment accumulator |
-| `state[userId + '_aptStep']` | `string` | `'name' \| 'phone' \| 'datetime' \| 'reason'` |
+| `state[userId + '_aptStep']` | `string` | `'name' \| 'phone' \| 'datetime' \| 'reason' \| 'email'` |
 | `state[userId + '_profileStep']` | `string` | `'location' \| 'conditions' \| 'university'` |
 | `state[userId + '_queued']` | `string` | User message queued while profile collection is in progress |
-| `state[userId + '_emailStep']` | `string` | `'to' \| 'confirm'` |
+| `state[userId + '_emailStep']` | `string` | `'to' \| 'confirm' \| 'capture_email'` |
 | `state[userId + '_emailDraft']` | `object` | Dispute letter draft (persists across send failures) |
 | `state[userId + '_pendingFile']` | `object` | File waiting for user to classify as "policy" or "bill" |
 | `state[userId + '_ctxHistory']` | `array` | Last 12 turns of contextual chat history |
@@ -46,7 +56,9 @@ Lives in memory, persisted to `bot-state.json` via `saveState()`. Keyed by userI
 
 `patientName`, `insuranceName`, `insuranceNumber`, `location`, `conditions`, `university`,
 `email`, `deductible`, `outOfPocketMax`, `copayPrimary`, `copaySpecialist`, `copayER`,
-`coinsurance`, `collected`, `locationSkipped`
+`coinsurance`, `collected`, `locationSkipped`,
+`firstNameSlack`, `realNameSlack`, `tzOffset` (seconds from UTC), `tz` (e.g. "America/Phoenix"),
+`slackEnriched` (flag — set true after first successful users.info call)
 
 Helpers: `getProfile(userId)` / `setProfile(userId, patch)` — always patch, never overwrite.
 
@@ -57,11 +69,11 @@ Helpers: `getProfile(userId)` / `setProfile(userId, patch)` — always patch, ne
 ```
 app.message()
   ├─ Dedup (processed Set — prevents socket replay)
-  ├─ Slack email fetch (users.info — once per user, cached in profile.email)
+  ├─ Slack email fetch (users.info — once per user, cached in profile via slackEnriched flag)
   ├─ File upload? → classify bill vs policy → processBillUploadAsync / processPolicyUploadAsync
   ├─ Pending file + "policy"/"bill" reply → classify saved file
   ├─ Greeting ("hi", "hello", "hey", "help", "start", empty)
-  │    ├─ Has policy → personalised greeting with coverage snapshot
+  │    ├─ Has policy → personalised greeting with coverage snapshot + first name from Slack
   │    └─ No policy → onboarding instructions
   └─ Everything else → handleChat(userId, text)
        ├─ No policy → "upload your policy first"
@@ -83,24 +95,40 @@ Order matters — earlier checks take priority. Do not reorder.
 3. `EMAIL_INTENT` → `startEmail()`
 4. `BENEFITS_INTENT` → `handleBenefitsCard()`
 5. `PROFILE_INTENT` → `handleHealthProfile()`
-6. `MEDICAL_ADVICE_INTENT` → hard block with 911 reminder
-7. `SEARCH_INTENT` → `handleProviderSearch()` (OpenStreetMap/Overpass)
+6. `MEDICAL_ADVICE_INTENT` (+ `COVERAGE_QUERY` guard) → hard block with 911 reminder
+7. `SEARCH_INTENT` OR (`MEDICAL_FACILITY_RE` + `extractLocationFromText`) → `handleProviderSearch()`
 8. `LOCATION_INTENT` → `handleContextualChat()` (RAG + location endpoint)
-9. Default → `handleRagChat()` (standard RAG)
+9. Default → `handleRagChat()` (standard RAG) + `gapHint()` appended
 
 **Critical:** Email capture (step 2) must fire before `EMAIL_INTENT` (step 3). Otherwise
 "my email: user@example.com" matches `EMAIL_INTENT` and routes to the dispute flow.
 
-**Critical:** `SEARCH_INTENT` must fire before `LOCATION_INTENT`. The location intent
-matches broadly (any mention of "hospital" or "provider"). Search intent is narrower —
-it detects actual "find me X near me" queries and routes to real OSM data instead of
-Gemini speculation.
+**Critical:** Provider search (step 7) has two triggers:
+1. `SEARCH_INTENT` — "find a hospital near me", "hospitals near Phoenix"
+2. `MEDICAL_FACILITY_RE.test(text) && extractLocationFromText(text)` — "hospitals in Salt Lake City"
+
+This prevents "hospitals in Sacramento" from falling through to `LOCATION_INTENT` → RAG,
+which was returning policy-document examples (San Francisco) instead of real OSM data.
 
 ---
 
 ## Key functions
 
-### `tryParseDateTime(raw)`
+### Slack metadata enrichment
+
+Runs once per user at the top of `app.message()`, gated by `profile.slackEnriched`.
+Fetches `users.info` and stores `email`, `firstNameSlack`, `realNameSlack`, `tzOffset`
+(seconds from UTC), `tz` (IANA zone name) in the profile. Uses `slackEnriched: true`
+as the completion flag so the enrichment re-runs for users created before the timezone
+field was added.
+
+**Why `slackEnriched` not `!email`:** If email was stored in a prior session before
+`firstNameSlack` / `tzOffset` were added, the old guard would never re-fetch. The flag
+ensures the full enrichment always runs once per deployment change.
+
+---
+
+### `tryParseDateTime(raw, tzOffsetSeconds?)`
 Parses natural language dates for appointment booking. Returns `{ iso, display, date }` or
 `null` (caller re-asks).
 
@@ -117,8 +145,19 @@ Two-pass approach:
 
 ### `sanitizeUni(u)`
 Strips vague answers ("yes", "ok", etc.) and "yes, X" prefixes from the university field.
-Applied both at input time (profile step) and at appointment completion. Without this,
-calendar titles show "Medical Appointment — yes, Arizona State Health Center".
+Applied at **both** input time (profile step, before `setProfile`) and at appointment
+completion (via `finishAppointment`). Without this, profiles and calendar titles show
+"Medical Appointment — yes, Arizona State Health Center".
+
+### `extractLocationFromText(text)`
+Parses an explicit city/location from query text.
+- `"hospitals in Salt Lake City"` → `"Salt Lake City"`
+- `"find a doctor near Austin, TX"` → `"Austin, TX"`
+- `"hospitals near me"` → `null` (vague, falls back to `profile.location`)
+- `"hospitals in my network"` → `null` (filters out non-place words)
+
+Used in `handleProviderSearch` and `routeChat` to route city-specific provider queries
+to OSM instead of the RAG endpoint.
 
 ### `generateICS()` (in email.js)
 Uses **floating local time** (`DTSTART:YYYYMMDDTHHMMSS` — no `Z`) so the calendar event
@@ -126,10 +165,12 @@ appears at the correct local hour regardless of which timezone the calendar app 
 `DTSTAMP` uses UTC (required by spec). Includes a `VALARM` trigger at -PT30M.
 
 ### `handleProviderSearch()`
-Geocodes `profile.location` via Nominatim, then queries Overpass API for nearby
+Geocodes the search location via Nominatim, then queries Overpass API for nearby
 `hospital|clinic|urgent_care` amenities within 15km. Free, no API key. Adds Google Maps
 links per result. Always shows disclaimer to call ahead to verify insurance network status.
-Network filtering is impossible without an insurance API — do not attempt it.
+
+**Location priority:** `extractLocationFromText(text)` (explicit city in query) → `profile.location`.
+"hospitals in Salt Lake City" returns Salt Lake City results even when profile says "San Francisco".
 
 ### `resolvePolicyId(userId)`
 Returns `state[userId]` if present. Falls back to `beliefs.search('active policy_id')`.
@@ -138,12 +179,21 @@ the function throws.
 
 ### `calcDisputeScore(fin, discrepancy)`
 Heuristic 0–100 score:
-- Base 60 if discrepancies exist
-- +15 if total_overcharge > 0
-- +10 if network discount missing (`amount_saved` ≤ 0)
-- +10 if insurance payment missing
-- +5 if overcharge > $500
-- Clamped to 95 max
+- Base 50 with adjustments for number of discrepancy items (+5/+15/+25)
+- +15 if network discount missing
+- +12 if insurance payment missing
+- +4/+8 if overcharge > $50/$200
+- Clamped to 42–95 range
+
+### `gapHint(profile, text)`
+Appended to standard RAG replies when a critical profile field is missing and the
+user's query suggests they'd benefit from having it. Returns one hint or `null`.
+Rules (checked in order, first match wins):
+1. No email + asked about appointment/dispute/send → prompt to save email
+2. No location + asked about hospitals/doctors/nearby → prompt to share city
+3. No university + asked about campus/student/health center → prompt to share uni
+
+Only fires on the standard `handleRagChat` path.
 
 ---
 
@@ -169,22 +219,29 @@ Heuristic 0–100 score:
 6. Show dispute score (`calcDisputeScore`) in reply header
 
 ### Appointment booking (multi-step)
-Steps: `name` → `phone` → `datetime` → `reason`  
-State keys: `_aptStep` (current step) + `_apt` (accumulator)  
-Pre-seeds name/insurance/conditions/university from profile — skips steps that are already known.  
-On completion: generates Google Calendar link + sends `.ics` via `sendCalendarInvite` if
-`profile.email` is set and `isEmailConfigured()` is true.
+Steps: `name` → `phone` → `datetime` → `reason` → [`email` if missing] → DONE
+State keys: `_aptStep` (current step) + `_apt` (accumulator)
+Pre-seeds name/insurance/conditions/university from profile — skips steps that are already known.
+The `email` step is injected dynamically after `reason` if `!profile.email && isEmailConfigured()`.
+Completion logic lives in `finishAppointment(userId, apt, profile)` — shared by both the `reason`
+path (email already known) and the `email` path (just collected).
 
-### Email dispute (multi-step)
-Steps: `to` → `confirm`  
-- `to === 'me'` resolves to `profile.email || process.env.GMAIL_USER`  
-- Shows `previewLetter()` preview with "Reply *send* to confirm"  
-- On send failure: keeps state so user can fix `.env` and retry with "send"  
-- Only clears `_emailDraft` after confirmed successful send
+**State cleanup:** `_aptStep` and `_apt` are deleted BEFORE calling `finishAppointment` so the
+next user message doesn't re-enter appointment flow. The email path deletes explicitly; the reason
+path (email already on file) deletes inline before the call.
+
+### Dispute email (multi-step)
+Steps: [`capture_email` if "me" and no email] → `to` → `confirm` → DONE
+If user types "me" and `!profile.email`, enters `capture_email` step which collects email,
+saves it to profile, then continues to the `to` step with the captured address.
+
+On send failure: keeps `_emailDraft` state so user can fix `.env` and retry with "send".
+Only clears `_emailDraft` after confirmed successful send.
 
 ### Profile collection (triggered after first policy upload or first chat)
-Steps: `location` → `conditions` → `university`  
-`skip` accepted at any step. University step rejects bare yes/no (asks for actual name).  
+Steps: `location` → `conditions` → `university`
+`skip` accepted at any step. University step rejects bare yes/no (asks for actual name).
+University stored via `sanitizeUni()` to strip "yes, X" prefixes before saving.
 Sets `profile.collected = true` when done. If a message was queued during collection,
 answers it immediately after profile is saved.
 
@@ -225,10 +282,21 @@ All calls use `api = axios.create({ baseURL: BACKEND, timeout: 60_000 })`.
 
 ## Email / calendar
 
-Requires `GMAIL_USER` + `GMAIL_APP_PASSWORD` in `.env`.  
-`isEmailConfigured()` gates all email features gracefully.  
-`.ics` files use `contentType: 'text/calendar; method=REQUEST'`.  
+Requires `GMAIL_USER` + `GMAIL_APP_PASSWORD` in `.env`.
+`isEmailConfigured()` gates all email features gracefully.
+`.ics` files use `contentType: 'text/calendar; method=REQUEST'`.
 `sendCalendarInvite` attaches the `.ics` to an email sent to `profile.email`.
+
+---
+
+## Security & ops
+
+- `.env` files are gitignored via `.env*` pattern in root `.gitignore`
+- `bot-state.json` is gitignored — contains real user PII (names, insurance numbers)
+- `heal-slack-bot/tmp_*` is gitignored — temp upload files auto-cleaned via `finally` block
+- `bot-state.json` is written atomically (`.tmp` → `rename`) to prevent corruption on crash
+- Sessions (`_session` keys) are **not persisted** — recreated lazily; stale sessions
+  auto-retry with a fresh session on 4xx response
 
 ---
 
@@ -239,21 +307,21 @@ Requires `GMAIL_USER` + `GMAIL_APP_PASSWORD` in `.env`.
 - **"yes" stored as university name**: `sanitizeUni()` strips vague answers and
   "yes, X" prefixes. Applied at input time AND at appointment completion.
 - **`docId = 'latest'` corruption**: removed. If docId can't be determined, throw.
-  Never store a non-numeric string as policyId — it breaks bill checking and persists.
-- **Email routed to dispute flow**: email capture regex fires before `EMAIL_INTENT`. 
+  Never store a non-numeric string as policyId.
+- **Email routed to dispute flow**: email capture regex fires before `EMAIL_INTENT`.
   Do not reorder.
-- **Socket replay**: dedup `processed` Set at the top of `app.message()`. Capped at 1000
-  entries before reset.
+- **Socket replay**: dedup `processed` Set at top of `app.message()`. Capped at 1000.
 - **ICS timezone**: use floating local time (no `Z`) for `DTSTART`. UTC (`Z`) only for `DTSTAMP`.
+- **Appointment state stuck**: `_aptStep` and `_apt` must be deleted before `finishAppointment`
+  in the reason path (email already on file). Without it, next message re-enters appointment flow.
+- **"hospitals in Sacramento" → RAG**: Fixed. `extractLocationFromText` detects named cities
+  and routes to OSM via `MEDICAL_FACILITY_RE` + explicit location check before `LOCATION_INTENT`.
 
 ---
 
 ## Open TODOs
 
-- **Session retry on stale sessionId**: if `POST /chat/sessions/:id/messages` returns 4xx,
-  clear `state[userId + '_session']` and retry with a new session. Currently fails until
-  bot restart.
-- **Startup cleanup of orphaned placeholder messages**: on start, find and delete any
+- **Startup cleanup of orphaned placeholder messages** — On bot start, find and delete any
   "Thinking..." / "_Reading..._" placeholder messages left over from a previous crash.
 
 ---
@@ -261,9 +329,15 @@ Requires `GMAIL_USER` + `GMAIL_APP_PASSWORD` in `.env`.
 ## Running
 
 ```bash
+# Backend (required first)
+cd backend
+source venv/Scripts/activate  # Windows: venv\Scripts\activate
+python main.py                 # runs on :8000
+
+# Slack bot
 cd heal-slack-bot
+cp .env.example .env           # fill in your keys
 node app.js
 ```
 
-Backend must be running first (`cd backend && python main.py`).  
-Socket mode — no public URL needed.
+Socket mode — no public URL or ngrok needed.
