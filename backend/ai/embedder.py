@@ -41,7 +41,7 @@ class GeminiEmbedder:
     """
     
     def __init__(self, 
-                 model_name: str = "text-embedding-004",
+                 model_name: str = "embedding-001",
                  dimension: int = 768,
                  enable_fallback: bool = True):
         """
@@ -119,11 +119,10 @@ class GeminiEmbedder:
                 if result.success:
                     self.stats["successful_requests"] += 1
                     logger.debug(f"✅ Gemini embedding generated in {execution_time}ms")
+                    return result
                 else:
                     self.stats["failed_requests"] += 1
-                    logger.warning(f"⚠️ Gemini embedding failed: {result.error_message}")
-                
-                return result
+                    logger.warning(f"⚠️ Gemini embedding failed: {result.error_message}. Falling back...")
                 
             except Exception as e:
                 logger.error(f"❌ Unexpected error in Gemini embedding: {e}")
@@ -301,7 +300,7 @@ def get_embedder() -> GeminiEmbedder:
         _embedder = GeminiEmbedder()
     return _embedder
 
-def initialize_embedder(model_name: str = "text-embedding-004", 
+def initialize_embedder(model_name: str = "embedding-001", 
                        dimension: int = 768,
                        enable_fallback: bool = True) -> GeminiEmbedder:
     """Initialize the global embedder with custom settings"""

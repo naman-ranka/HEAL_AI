@@ -179,7 +179,7 @@ class RAGRetriever:
             logger.error(f"❌ Error generating query embedding: {e}")
             return self._create_simple_embedding(query)
     
-    def _create_simple_embedding(self, text: str, dim: int = 384) -> np.ndarray:
+    def _create_simple_embedding(self, text: str, dim: int = 768) -> np.ndarray:
         """Create a simple hash-based embedding as fallback"""
         import hashlib
         hash_obj = hashlib.md5(text.lower().encode())  # Lowercase for consistency
