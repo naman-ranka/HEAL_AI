@@ -308,7 +308,7 @@ class DocumentProcessor:
             logger.error(f"❌ Error processing chunks for document {document_id}: {e}")
             raise
     
-    def _create_simple_embedding(self, text: str, dim: int = 384) -> np.ndarray:
+    def _create_simple_embedding(self, text: str, dim: int = 768) -> np.ndarray:
         """Create a simple hash-based embedding as fallback"""
         # Simple hash-based embedding for development
         import hashlib
