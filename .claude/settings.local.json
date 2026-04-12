@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/naman/Desktop/Projects/HEAL/heal-slack-bot/node_modules/beliefs -name *.d.ts)"
+    ]
+  }
+}
