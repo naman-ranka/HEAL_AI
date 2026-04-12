@@ -36,5 +36,31 @@
       "ts": 1775995019237
     }
   ],
-  "U0AT5CJFUMN_session": "b2a1114a-aa52-47d2-a5e5-7729d11d6bae"
+  "U0AT5CJFUMN_session": "b2a1114a-aa52-47d2-a5e5-7729d11d6bae",
+  "U0AS5PH901H": 36,
+  "U0AS5PH901H_profile": {
+    "insuranceName": "UnitedHealthcare Student Resources",
+    "patientName": "Pranav Kutralingam",
+    "insuranceNumber": "2025-733-1",
+    "deductible": 250,
+    "outOfPocketMax": 1500,
+    "coinsurance": "20%",
+    "location": "Tempe. AZ",
+    "conditions": "mome",
+    "university": "yes, Arizona State",
+    "collected": true
+  },
+  "U0AS5PH901H_session": "07d12897-b089-4a39-8733-874c7da410e1",
+  "U0AS5PH901H_ctxHistory": [
+    {
+      "role": "user",
+      "text": "does it cover care for stomach ache?",
+      "ts": 1775996692710
+    },
+    {
+      "role": "assistant",
+      "text": "Yes, your UnitedHealthcare Student Resources plan, policy #2025-733-1, typically covers care for medically necessary conditions like a stomach ache.\n\nIf you're experiencing a stomach ache and need to see a doctor, you would generally visit an in-network provider, and any costs would count towards your deductible and out-of-pocket maximum.\n\n*   Your **in-network deductible** is **$250**.\n*   Your **in-network out-of-pocket maximum** is **$1500**.\n\nWould you like me to help you find an in-network urgent care center or primary care provider near your location in Tempe, AZ?",
+      "ts": 1775996692713
+    }
+  ]
 }

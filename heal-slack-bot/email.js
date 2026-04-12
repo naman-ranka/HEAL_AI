@@ -10,6 +10,92 @@
 
 import nodemailer from 'nodemailer';
 
+// ── ICS (calendar invite) generator ──────────────────────────────────────────
+
+function generateICS({ name, university, phone, datetime, reason, insuranceName, insuranceNumber, conditions }) {
+    const uniHealth = university ? `${university} Health Center` : 'Campus Health Center';
+    const now       = new Date();
+
+    // Use local floating time (no Z) so the event shows at the right hour in any timezone.
+    // "20260415T090000" means 9 AM wherever the calendar app is opened.
+    const fmtLocal = d => {
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+               `T${pad(d.getHours())}${pad(d.getMinutes())}00`;
+    };
+    // Stamp still uses UTC (standard requirement)
+    const fmtUTC = d => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+
+    let dtStart = new Date(datetime);  // datetime is now an ISO string from tryParseDateTime
+    if (isNaN(dtStart.getTime())) dtStart = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const dtEnd = new Date(dtStart.getTime() + 60 * 60 * 1000);
+
+    const desc = [
+        `Patient: ${name || 'N/A'}`,
+        `Phone: ${phone || 'N/A'}`,
+        `Insurance: ${insuranceName || 'N/A'}`,
+        `Insurance #: ${insuranceNumber || 'N/A'}`,
+        `Conditions: ${conditions || 'None'}`,
+        `Reason: ${reason || 'N/A'}`,
+    ].join('\\n');
+
+    return [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//HEAL AI//Medical Appointment//EN',
+        'METHOD:REQUEST',
+        'BEGIN:VEVENT',
+        `UID:heal-apt-${Date.now()}@healai`,
+        `DTSTAMP:${fmtUTC(now)}`,
+        `DTSTART:${fmtLocal(dtStart)}`,
+        `DTEND:${fmtLocal(dtEnd)}`,
+        `SUMMARY:Medical Appointment — ${uniHealth}`,
+        `DESCRIPTION:${desc}`,
+        `LOCATION:${uniHealth}`,
+        'BEGIN:VALARM',
+        'TRIGGER:-PT30M',
+        'ACTION:DISPLAY',
+        'DESCRIPTION:Appointment reminder — 30 minutes',
+        'END:VALARM',
+        'END:VEVENT',
+        'END:VCALENDAR',
+    ].join('\r\n');
+}
+
+/**
+ * Email a calendar invite (.ics) to the patient.
+ */
+export async function sendCalendarInvite({ to, ...apt }) {
+    const uniHealth = apt.university ? `${apt.university} Health Center` : 'Campus Health Center';
+    const ics       = generateICS(apt);
+
+    const transport = createTransport();
+    const subject   = `Medical Appointment — ${uniHealth} — ${apt.datetime || 'Time TBD'}`;
+
+    await transport.sendMail({
+        from:    `"HEAL AI" <${process.env.GMAIL_USER}>`,
+        to,
+        subject,
+        text:
+            `Your appointment request at ${uniHealth} has been confirmed.\n\n` +
+            `Patient: ${apt.name || 'N/A'}\n` +
+            `Insurance: ${apt.insuranceName || 'N/A'}\n` +
+            `Date/Time: ${apt.datetime || 'TBD'}\n` +
+            `Reason: ${apt.reason || 'N/A'}\n\n` +
+            `Open the attached .ics file to add this to your calendar.\n\n` +
+            `— HEAL AI`,
+        attachments: [
+            {
+                filename:    'appointment.ics',
+                content:     ics,
+                contentType: 'text/calendar; method=REQUEST',
+            },
+        ],
+    });
+
+    return { to, subject };
+}
+
 function createTransport() {
     return nodemailer.createTransport({
         service: 'gmail',

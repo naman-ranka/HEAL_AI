@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { isEmailConfigured, sendDisputeLetter, previewLetter } from './email.js';
+import { isEmailConfigured, sendDisputeLetter, previewLetter, sendCalendarInvite } from './email.js';
 
 import pkg from '@slack/bolt';
 const { App, LogLevel } = pkg;
@@ -169,6 +169,18 @@ app.message(async ({ message, client }) => {
     processed.add(message.ts);
     if (processed.size > 1000) processed.clear();
 
+    // Eagerly fetch + cache the user's Slack email (once per user, silently skipped if scope missing)
+    if (!getProfile(userId).email) {
+        try {
+            const userInfo = await client.users.info({ user: userId });
+            const slackEmail = userInfo?.user?.profile?.email;
+            if (slackEmail) {
+                setProfile(userId, { email: slackEmail });
+                console.log(`[slack-email] cached ${slackEmail} for ${userId}`);
+            }
+        } catch { /* users:read.email scope not granted — skip */ }
+    }
+
     console.log(`[msg] user=${userId} text="${text.slice(0,80)}"`);
 
     try {
@@ -268,25 +280,59 @@ app.message(async ({ message, client }) => {
 
         // ── Greeting ──────────────────────────────────────────────────────────
         if (!text || /^(hi|hello|hey|help|start)\b/i.test(lc)) {
-            await client.chat.postMessage({
-                channel,
-                text:
-                    "👋 *Hi! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n" +
-                    "*What I can do:*\n" +
-                    "• 📋 Explain your insurance coverage in plain English\n" +
-                    "• 🏥 Find nearby in-network hospitals, urgent care & specialists\n" +
-                    "• 🧾 Audit medical bills and catch overcharges\n" +
-                    "• 💬 Answer coverage questions (copay, deductible, what's covered)\n" +
-                    "• 📅 Book a campus health center appointment with a calendar invite\n" +
-                    "• 📧 Send a formal billing dispute letter straight from Slack\n\n" +
-                    "*Get started:*\n" +
-                    "1. Upload your *insurance policy* PDF — include the word *policy* in your message\n" +
-                    "2. I'll ask a few quick questions to personalise your experience _(all optional)_\n" +
-                    "3. Ask anything — or upload a medical bill to check for errors\n" +
-                    "4. Type *\"book appointment\"* to schedule a campus clinic visit\n" +
-                    "5. Type *\"email dispute\"* to send a billing dispute letter\n\n" +
-                    "⚠️ _I don't provide medical diagnoses or treatment advice — for emergencies, call 911._",
-            });
+            const policyId = state[userId];
+            if (policyId) {
+                // ── Personalised returning-user greeting ──────────────────────
+                const profile  = getProfile(userId);
+                const lastBill = state[`${userId}_lastBill`] || null;
+                const firstName = profile.patientName?.split(' ')[0];
+
+                let greet = `👋 *Hey${firstName ? ` ${firstName}` : ''}!* Welcome back to HEAL.\n\n`;
+
+                // Coverage snapshot
+                greet += `📋 *Your Coverage*\n`;
+                if (profile.insuranceName)   greet += `> Insurance: *${profile.insuranceName}*\n`;
+                if (profile.insuranceNumber) greet += `> Member ID: *${profile.insuranceNumber}*\n`;
+                if (profile.deductible     != null) greet += `> Deductible: *${fmt$(profile.deductible)}*/yr\n`;
+                if (profile.copayPrimary   != null) greet += `> Primary Care: *${fmt$(profile.copayPrimary)} copay*\n`;
+                if (profile.outOfPocketMax != null) greet += `> Out-of-Pocket Max: *${fmt$(profile.outOfPocketMax)}*/yr\n`;
+
+                // Last bill status
+                if (lastBill?.totalOvercharge > 0) {
+                    greet += `\n🚨 *Last Bill:* ${fmt$(lastBill.totalOvercharge)} overcharge detected — type *"email dispute"* to send a formal letter\n`;
+                } else if (lastBill) {
+                    greet += `\n✅ *Last Bill:* No discrepancies found\n`;
+                }
+
+                greet += `\n*Quick commands:*\n`;
+                greet += `• *"my benefits"* — full coverage card\n`;
+                greet += `• *"my health profile"* — everything HEAL knows about you\n`;
+                greet += `• *"hospitals near me"* — find nearby providers\n`;
+                greet += `• *"book appointment"* — campus health center\n`;
+
+                await client.chat.postMessage({ channel, text: greet });
+            } else {
+                // ── First-time onboarding ──────────────────────────────────────
+                await client.chat.postMessage({
+                    channel,
+                    text:
+                        "👋 *Hi! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n" +
+                        "*What I can do:*\n" +
+                        "• 📋 Explain your insurance coverage in plain English\n" +
+                        "• 🏥 Find nearby in-network hospitals, urgent care & specialists\n" +
+                        "• 🧾 Audit medical bills and catch overcharges\n" +
+                        "• 💬 Answer coverage questions (copay, deductible, what's covered)\n" +
+                        "• 📅 Book a campus health center appointment with a calendar invite\n" +
+                        "• 📧 Send a formal billing dispute letter straight from Slack\n\n" +
+                        "*Get started:*\n" +
+                        "1. Upload your *insurance policy* PDF — include the word *policy* in your message\n" +
+                        "2. I'll ask a few quick questions to personalise your experience _(all optional)_\n" +
+                        "3. Ask anything — or upload a medical bill to check for errors\n" +
+                        "4. Type *\"book appointment\"* to schedule a campus clinic visit\n" +
+                        "5. Type *\"email dispute\"* to send a billing dispute letter\n\n" +
+                        "⚠️ _I don't provide medical diagnoses or treatment advice — for emergencies, call 911._",
+                });
+            }
             return;
         }
 
@@ -359,10 +405,18 @@ async function processPolicyUploadAsync(userId, file, client, channel, ts) {
                 const carrier      = job.result?.policyDetails?.carrier;
                 const policyHolder = job.result?.policyDetails?.policyHolder;
                 const policyNumber = job.result?.policyDetails?.policyNumber;
+                const net          = job.result?.coverageCosts?.inNetwork;
                 const profilePatch = {};
                 if (carrier)      profilePatch.insuranceName    = carrier;
                 if (policyHolder) profilePatch.patientName      = policyHolder;
                 if (policyNumber) profilePatch.insuranceNumber  = policyNumber;
+                // Store key cost numbers for benefits card + personalized greeting
+                if (net?.deductible?.individual      != null) profilePatch.deductible      = net.deductible.individual;
+                if (net?.outOfPocketMax?.individual  != null) profilePatch.outOfPocketMax  = net.outOfPocketMax.individual;
+                if (net?.copay?.primaryCare          != null) profilePatch.copayPrimary    = net.copay.primaryCare;
+                if (net?.copay?.specialist           != null) profilePatch.copaySpecialist = net.copay.specialist;
+                if (net?.copay?.emergencyRoom        != null) profilePatch.copayER         = net.copay.emergencyRoom;
+                if (net?.coinsurance)                         profilePatch.coinsurance     = net.coinsurance;
                 if (Object.keys(profilePatch).length) setProfile(userId, profilePatch);
 
                 saveState(state);
@@ -373,7 +427,6 @@ async function processPolicyUploadAsync(userId, file, client, channel, ts) {
                     ];
                     if (carrier)
                         items.push({ text: `Insurance carrier is ${carrier}`, confidence: 0.95, type: 'evidence', source: 'heal' });
-                    const net = job.result?.coverageCosts?.inNetwork;
                     if (net?.deductible?.individual != null)
                         items.push({ text: `In-network deductible is $${net.deductible.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
                     if (net?.outOfPocketMax?.individual != null)
@@ -493,10 +546,11 @@ async function processBillUploadAsync(userId, file, client, channel, ts) {
                     { source: 'heal_bill' }
                 ));
                 if (hasDiscrepancy) {
-                    bgB(userId, b => b.add(
-                        `Billing discrepancy: ${discrepancy?.substring(0, 120)}`,
-                        { type: 'risk', confidence: 0.9, source: 'heal_bill' }
-                    ));
+                    const ds = calcDisputeScore(fin, discrepancy);
+                    bgB(userId, b => b.add([
+                        { text: `Billing discrepancy: ${discrepancy?.substring(0, 120)}`, type: 'risk', confidence: 0.9, source: 'heal_bill' },
+                        { text: `Billing dispute success probability is ${ds}%`, type: 'evidence', confidence: 0.8, source: 'heal_bill' },
+                    ]));
                 }
 
                 const overcharge = fin?.total_overcharge;
@@ -505,7 +559,10 @@ async function processBillUploadAsync(userId, file, client, channel, ts) {
                 let reply;
                 if (hasDiscrepancy) {
                     const overchargeLabel = overcharge > 0 ? ` — *${fmt$(overcharge)} overcharge detected*` : '';
-                    reply = `🚨 *Billing Errors Found!*${overchargeLabel}\n\n`;
+                    const disputeScore = calcDisputeScore(fin, discrepancy);
+                    const scoreLabel = disputeScore >= 80 ? 'Strong case' : disputeScore >= 65 ? 'Good case' : 'Reasonable case';
+                    reply = `🚨 *Billing Errors Found!*${overchargeLabel}\n`;
+                    reply += `🎯 *Dispute Likelihood: ${disputeScore}% — ${scoreLabel}*\n\n`;
 
                     // Financial summary
                     reply += `*Financial Summary*\n`;
@@ -585,6 +642,12 @@ const APPOINTMENT_INTENT = /book|schedule|appointment|appt|campus (health|clinic
 const EMAIL_INTENT = /email|dispute (letter|email)|reimburs|send.*bill|billing (dispute|complaint)|send.*email/i;
 // Retry keywords that should re-enter an in-progress email confirm step
 const EMAIL_RETRY = /^(send|try again|retry|yes)$/i;
+
+// Benefits card intent
+const BENEFITS_INTENT = /\bmy (benefits?|coverage|plan|insurance summary|policy summary)\b|show (my )?(benefits?|coverage|plan)|what('s| is) (covered|my coverage|my benefits?|my plan)|coverage (summary|card|overview)/i;
+
+// Health profile / beliefs world state intent
+const PROFILE_INTENT = /\bmy (health )?profile\b|(show|what) (do you know about me|is my profile|have you learned|have you stored)|health (profile|summary|record)/i;
 
 /** Build a Google Calendar quick-add URL pre-filled with appointment details */
 function makeCalendarLink({ name, university, phone, datetime, reason, insuranceName, insuranceNumber, conditions }) {
@@ -669,8 +732,14 @@ async function handleChat(userId, text) {
     }
 
     if (step === 'university') {
-        if (!/^skip$/i.test(text.trim())) {
-            const uni = text.trim();
+        const uniInput = text.trim();
+        // Reject bare yes/no — user probably answered "are you a student?" instead of giving the name
+        const isVague = /^(yes|no|yeah|nope|ok|okay|sure|n\/a|na|none|nah|yep|yup|maybe|idk|not sure)$/i.test(uniInput);
+        if (isVague) {
+            return `🎓 Got it! What's the *name* of your university?\n_(e.g. "Arizona State University")_\n\n_Type "skip" if you're not a student or prefer not to say._`;
+        }
+        if (!/^skip$/i.test(uniInput)) {
+            const uni = uniInput;
             setProfile(userId, { university: uni });
             bgB(userId, b => b.add([
                 { text: `Student at ${uni}`, confidence: 0.95, type: 'evidence', source: 'user' }
@@ -710,9 +779,105 @@ async function handleChat(userId, text) {
 
 // ── Appointment booking ───────────────────────────────────────────────────────
 
+// ── Date/time parser for appointment booking ─────────────────────────────────
+// Returns { iso, display } on success, null if the input is too ambiguous.
+// Stores ISO string so generateICS always gets a clean Date — no more guessing.
+
+function tryParseDateTime(raw) {
+    const now = new Date();
+    const yr  = now.getFullYear();
+
+    // Helper: build a { iso, display, date } result from a resolved Date
+    const makeResult = d => ({
+        iso:     d.toISOString(),
+        display: d.toLocaleString('en-US', {
+            weekday: 'long', year: 'numeric', month: 'long',
+            day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+        }),
+        date: d,
+    });
+
+    // 0. Handle relative weekday names: "monday", "next friday 3pm", "this tuesday at 9am"
+    //    V8's Date parser resolves bare weekday names to arbitrary far-future dates — do it ourselves.
+    const WEEKDAY_RE = /^(?:(next|this)\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b(.*)/i;
+    const wdMatch = raw.trim().match(WEEKDAY_RE);
+    if (wdMatch) {
+        const modifier  = (wdMatch[1] || '').toLowerCase();   // 'next', 'this', or ''
+        const weekday   = wdMatch[2].toLowerCase();
+        const timePart  = wdMatch[3].trim();
+        const DAYS      = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+        const targetDay = DAYS.indexOf(weekday);
+
+        const base = new Date(now);
+        base.setHours(0, 0, 0, 0);
+        let daysAhead = ((targetDay - base.getDay()) + 7) % 7;
+        if (daysAhead === 0) daysAhead = 7;    // today is that day → next week's occurrence
+        if (modifier === 'next') daysAhead += 7; // "next X" → skip the immediate one
+        base.setDate(base.getDate() + daysAhead);
+
+        // Parse the time component if provided ("3pm", "at 2:30 PM", "14:00", "9 AM")
+        if (timePart) {
+            // Strip filler words, collapse spaces — but do NOT pre-normalise digits here
+            // (pre-normalising "2:30 PM" → "2:30:00 PM" would break the 12-hr regex below)
+            const t = timePart.replace(/\bat\b/gi, ' ').replace(/\s+/g, ' ').trim();
+
+            // 12-hour: "2 PM", "2:30pm", "2:30 PM", "9AM"
+            const m12 = t.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+            // 24-hour: "14:30" (only when no am/pm found)
+            const m24 = !m12 && t.match(/(\d{1,2}):(\d{2})/);
+
+            if (m12) {
+                let h = parseInt(m12[1]);
+                const min = parseInt(m12[2] || '0');
+                const ap = m12[3].toUpperCase();
+                if (ap === 'PM' && h < 12) h += 12;
+                if (ap === 'AM' && h === 12) h = 0;
+                base.setHours(h, min, 0, 0);
+            } else if (m24) {
+                base.setHours(parseInt(m24[1]), parseInt(m24[2]), 0, 0);
+            }
+        }
+
+        return makeResult(base);
+    }
+
+    // 1. Capitalise month names so V8 handles "april" reliably
+    const withMonth = raw.replace(
+        /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/gi,
+        m => m.charAt(0).toUpperCase() + m.slice(1).toLowerCase()
+    );
+
+    // 2. "9am" / "9 am" → "9:00 AM"  (must run before "at" removal)
+    const normed = withMonth
+        .replace(/\b(\d{1,2})\s*(am|pm)\b/gi, (_, h, ap) => `${h}:00 ${ap.toUpperCase()}`)
+        .replace(/\bat\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    // 3. Try: normed as-is, then append current year, then next year
+    for (const candidate of [normed, `${normed} ${yr}`, `${normed} ${yr + 1}`]) {
+        const d = new Date(candidate);
+        if (!isNaN(d.getTime()) && d.getFullYear() >= 2024 && d.getFullYear() <= 2030) {
+            // Bump to next year if the date is > 1 day in the past (recurring annual dates)
+            if (d < new Date(now.getTime() - 86_400_000)) d.setFullYear(d.getFullYear() + 1);
+            return makeResult(d);
+        }
+    }
+    return null;  // caller should re-ask
+}
+
+// Strips vague yes/no answers and accidental "yes, X" prefixes from university field
+function sanitizeUni(u) {
+    if (!u) return null;
+    const VAGUE_EXACT = /^(yes|no|yeah|nope|ok|okay|sure|n\/a|na|none|nah|yep|yup|maybe|idk)$/i;
+    if (VAGUE_EXACT.test(u.trim())) return null;
+    const stripped = u.trim().replace(/^(yes|no|yeah|nope|ok|okay)\s*[,;]\s*/i, '').trim();
+    return stripped || null;
+}
+
 async function startAppointment(userId) {
     const profile = getProfile(userId);
-    const uni     = profile.university;
+    const uni     = sanitizeUni(profile.university);
     const uniHealth = uni ? `${uni} Health Center` : 'your campus health center';
 
     // Seed accumulator with whatever we already know from the policy
@@ -771,12 +936,24 @@ async function handleAppointmentStep(userId, text) {
     }
 
     if (aptStep === 'datetime') {
-        apt.datetime = text.trim();
-        state[`${userId}_apt`]   = apt;
+        const parsed = tryParseDateTime(text.trim());
+        if (!parsed) {
+            // Don't advance the step — ask again with a clear example
+            return (
+                `🗓️ I couldn't parse *"${text.trim()}"* as a date and time.\n\n` +
+                `Please be more specific:\n` +
+                `• *"April 20 at 9am"*\n` +
+                `• *"April 20, 2026 2:30pm"*\n` +
+                `• *"2026-04-20 14:30"*`
+            );
+        }
+        apt.datetime        = parsed.iso;      // ISO string → ICS generation is reliable
+        apt.datetimeDisplay = parsed.display;  // human-readable for Slack
+        state[`${userId}_apt`]     = apt;
         state[`${userId}_aptStep`] = 'reason';
         saveState(state);
         return (
-            `🗓️ *Date/Time:* ${apt.datetime} ✓\n\n` +
+            `🗓️ *Date/Time:* ${parsed.display} ✓\n\n` +
             `What is the *reason for your visit?*\n` +
             `_(e.g. "annual checkup", "sore throat", "prescription refill")_`
         );
@@ -789,9 +966,27 @@ async function handleAppointmentStep(userId, text) {
         delete state[`${userId}_apt`];
         saveState(state);
 
-        const calLink   = makeCalendarLink({ ...apt, ...profile });
-        const uni       = apt.university || profile.university;
+        // Sanitize university (reuses top-level sanitizeUni — strips "yes", "yes, X" prefix, etc.)
+        const uni = sanitizeUni(apt.university) || sanitizeUni(profile.university) || null;
+        const aptMerged = { ...apt, ...profile, university: uni };
+
+        const calLink   = makeCalendarLink(aptMerged);
         const uniHealth = uni ? `${uni} Health Center` : 'Campus Health Center';
+
+        // Send .ics calendar invite via email if we have the user's email
+        const toEmail = profile.email;
+        let emailNote = '';
+        if (toEmail && isEmailConfigured()) {
+            try {
+                await sendCalendarInvite({ to: toEmail, ...aptMerged });
+                emailNote = `\n\n📧 *Calendar invite sent to* ${toEmail}`;
+            } catch (err) {
+                console.error('[calendar-email]', err.message);
+                emailNote = `\n\n⚠️ _Couldn't send calendar email: ${err.message}_`;
+            }
+        } else if (!toEmail) {
+            emailNote = `\n\n_ℹ️ No email on file — click the link above to add it to your calendar manually._`;
+        }
 
         return (
             `📅 *Appointment Request Ready!*\n\n` +
@@ -800,10 +995,10 @@ async function handleAppointmentStep(userId, text) {
             `*Phone:* ${apt.phone}\n` +
             `*Insurance:* ${apt.insuranceName || 'On file'} (${apt.insuranceNumber || 'see policy'})\n` +
             `*Conditions:* ${apt.conditions || profile.conditions || 'None reported'}\n` +
-            `*Date/Time:* ${apt.datetime}\n` +
+            `*Date/Time:* ${apt.datetimeDisplay || apt.datetime}\n` +
             `*Reason:* ${apt.reason}\n\n` +
-            `👉 <${calLink}|*Add to Google Calendar*>\n\n` +
-            `_Click the link to save this to your calendar. Contact ${uniHealth} directly to confirm your booking._`
+            `👉 <${calLink}|*Add to Google Calendar*>` +
+            emailNote
         );
     }
 
@@ -852,7 +1047,10 @@ async function handleEmailStep(userId, text) {
 
     if (emailStep === 'to') {
         const rawTo = text.trim();
-        const to = rawTo.toLowerCase() === 'me' ? process.env.GMAIL_USER : rawTo;
+        // "me" → use the user's cached Slack email, then fall back to the bot's own Gmail address
+        const to = rawTo.toLowerCase() === 'me'
+            ? (profile.email || process.env.GMAIL_USER)
+            : rawTo;
 
         const draft = {
             to,
@@ -932,9 +1130,31 @@ async function routeChat(userId, text, policyId) {
         return await startAppointment(userId);
     }
 
+    // Email address capture — "my email is X" / "my email: X" / "email: X@Y.com"
+    // Must fire BEFORE EMAIL_INTENT (which would wrongly match the word "email")
+    const emailCapture = text.match(/(?:my\s+)?email\s*(?:is|[:=])\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})/i);
+    if (emailCapture) {
+        const captured = emailCapture[1].toLowerCase();
+        setProfile(userId, { email: captured });
+        bgB(userId, b => b.add([
+            { text: `User email is ${captured}`, confidence: 1.0, type: 'evidence', source: 'user' }
+        ]));
+        return `✅ *Email saved:* ${captured}\n\n_I'll use this for calendar invites and dispute letters._`;
+    }
+
     // Reimbursement email
     if (EMAIL_INTENT.test(text)) {
         return await startEmail(userId);
+    }
+
+    // Benefits coverage card
+    if (BENEFITS_INTENT.test(text)) {
+        return await handleBenefitsCard(userId, policyId);
+    }
+
+    // Health profile / beliefs world state
+    if (PROFILE_INTENT.test(text)) {
+        return await handleHealthProfile(userId);
     }
 
     // Hard block: medical advice
@@ -1101,6 +1321,127 @@ async function handleProviderSearch(userId, text, profile) {
             `Search directly: <${fallback}|🗺️ Hospitals near ${location} — Google Maps>`
         );
     }
+}
+
+// ── Benefits card ─────────────────────────────────────────────────────────────
+
+function formatBenefitsCard(profile) {
+    let msg = `📋 *${profile.insuranceName || 'Your Insurance'} — Coverage Summary*\n\n`;
+
+    if (profile.patientName)    msg += `*Policyholder:* ${profile.patientName}\n`;
+    if (profile.insuranceNumber) msg += `*Member ID:* ${profile.insuranceNumber}\n`;
+    if (profile.patientName || profile.insuranceNumber) msg += '\n';
+
+    msg += `*In-Network Benefits*\n`;
+    if (profile.deductible      != null) msg += `> 💰 Deductible: *${fmt$(profile.deductible)}/yr*\n`;
+    if (profile.copayPrimary    != null) msg += `> 🏥 Primary Care Visit: *${fmt$(profile.copayPrimary)} copay*\n`;
+    if (profile.copaySpecialist != null) msg += `> 🩺 Specialist Visit: *${fmt$(profile.copaySpecialist)} copay*\n`;
+    if (profile.copayER         != null) msg += `> 🚨 Emergency Room: *${fmt$(profile.copayER)} copay*\n`;
+    if (profile.coinsurance)             msg += `> 📊 Coinsurance: *${profile.coinsurance}*\n`;
+    if (profile.outOfPocketMax  != null) msg += `> 🛑 Out-of-Pocket Max: *${fmt$(profile.outOfPocketMax)}/yr*\n`;
+
+    msg += `\n_Ask me about specific procedures, referrals, or prescription coverage._`;
+    return msg;
+}
+
+async function handleBenefitsCard(userId, policyId) {
+    const profile = getProfile(userId);
+    const hasNumbers = profile.deductible != null || profile.copayPrimary != null || profile.outOfPocketMax != null;
+    if (hasNumbers) return formatBenefitsCard(profile);
+    // Fallback: ask RAG
+    return await handleRagChat(userId,
+        'Give me a structured summary of my deductible, copay amounts (primary care, specialist, ER), ' +
+        'coinsurance rate, and annual out-of-pocket maximum. Format as a clean bullet list.'
+    );
+}
+
+// ── Health profile (beliefs world state) ─────────────────────────────────────
+
+async function handleHealthProfile(userId) {
+    const profile  = getProfile(userId);
+    const lastBill = state[`${userId}_lastBill`] || null;
+
+    let msg = `🧬 *Your HEAL Health Profile*\n\n`;
+
+    // Personal details
+    if (profile.patientName || profile.insuranceName) {
+        msg += `*You*\n`;
+        if (profile.patientName)     msg += `> Name: ${profile.patientName}\n`;
+        if (profile.location)        msg += `> Location: ${profile.location}\n`;
+        if (profile.university)      msg += `> University: ${profile.university}\n`;
+        if (profile.conditions)      msg += `> Conditions: ${profile.conditions}\n`;
+        msg += '\n';
+    }
+
+    // Insurance
+    if (profile.insuranceName) {
+        msg += `*Insurance*\n`;
+        msg += `> Carrier: ${profile.insuranceName}\n`;
+        if (profile.insuranceNumber) msg += `> Member ID: ${profile.insuranceNumber}\n`;
+        if (profile.deductible     != null) msg += `> Deductible: ${fmt$(profile.deductible)}/yr\n`;
+        if (profile.copayPrimary   != null) msg += `> Primary Care: ${fmt$(profile.copayPrimary)} copay\n`;
+        if (profile.outOfPocketMax != null) msg += `> OOP Max: ${fmt$(profile.outOfPocketMax)}/yr\n`;
+        msg += '\n';
+    }
+
+    // Last bill
+    if (lastBill) {
+        msg += `*Last Bill Analysis*\n`;
+        if (lastBill.totalOvercharge > 0) {
+            msg += `> 🚨 Overcharge: ${fmt$(lastBill.totalOvercharge)}\n`;
+            msg += `> Correct amount owed: ${fmt$(lastBill.correctOwed)}\n`;
+        } else {
+            msg += `> ✅ No billing errors found\n`;
+        }
+        msg += '\n';
+    }
+
+    // Beliefs world state
+    const b = mkB(userId);
+    if (b) {
+        try {
+            const worldState = await b.read();
+            const beliefs = worldState?.beliefs ?? worldState?.state?.beliefs ?? [];
+            const active = beliefs
+                .filter(bel => !['retracted', 'removed', 'invalidated'].includes(bel.lifecycle))
+                .filter(bel => (bel.confidence ?? 0) >= 0.8)
+                .slice(0, 6);
+            if (active.length) {
+                msg += `*🧠 What HEAL Knows* _(Thinkn Belief Graph)_\n`;
+                active.forEach(bel => { msg += `> ${bel.text}\n`; });
+                msg += '\n';
+            }
+        } catch (e) { console.warn('[beliefs.read]', e.message); }
+    }
+
+    msg += `_Powered by HEAL AI + Thinkn Beliefs SDK_`;
+    return msg;
+}
+
+// ── Dispute probability score ─────────────────────────────────────────────────
+
+function calcDisputeScore(fin, discrepancy) {
+    let score = 50;
+
+    // Number of distinct discrepancies
+    const text = String(discrepancy || '');
+    const numItems = Math.max(1, (text.match(/\b\d+\./g) || []).length);
+    if (numItems >= 3) score += 25;
+    else if (numItems >= 2) score += 15;
+    else score += 5;
+
+    // Missing network discount — most winnable dispute
+    if (!fin?.amount_saved || fin.amount_saved === 0) score += 15;
+
+    // Insurance payment not applied
+    if (!fin?.insurance_payment || fin.insurance_payment === 0) score += 12;
+
+    // Overcharge magnitude
+    const overcharge = fin?.total_overcharge ?? 0;
+    if (overcharge > 200) score += 8;
+    else if (overcharge > 50) score += 4;
+
+    return Math.min(95, Math.max(42, score));
 }
 
 async function handleRagChat(userId, text) {
