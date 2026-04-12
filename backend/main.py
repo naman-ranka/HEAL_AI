@@ -1352,14 +1352,14 @@ CRITICAL INSTRUCTIONS:
         from ai.flows.policy_analysis import analyze_insurance_policy
         from ai.schemas import PolicyAnalysisInput, DocumentType
         
-        # Use Gemini 2.5 Pro for complex bill analysis
-        model = ai_config.get_model('pro')  # Use Pro model for better analysis
-        
+        # Use Gemini 2.5 Flash for bill analysis
+        model = ai_config.get_model('flash')
+
         if not model:
-            logger.error("❌ Failed to get Gemini Pro model - falling back to mock")
+            logger.error("❌ Failed to get Gemini Flash model - falling back to mock")
             return create_mock_bill_analysis("model_unavailable")
-        
-        logger.info("🤖 Generating AI bill analysis with Gemini 2.5 Pro...")
+
+        logger.info("🤖 Generating AI bill analysis with Gemini 2.5 Flash...")
         logger.info(f"📝 Prompt length: {len(analysis_prompt)} characters")
         logger.info(f"📄 Bill text length: {len(bill_text)} characters")
         logger.info(f"📋 Policy text length: {len(policy_text)} characters")

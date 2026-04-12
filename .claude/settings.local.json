@@ -1,7 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(find /c/Users/naman/Desktop/Projects/HEAL/heal-slack-bot/node_modules/beliefs -name *.d.ts)"
+      "Bash(find /c/Users/naman/Desktop/Projects/HEAL/heal-slack-bot/node_modules/beliefs -name *.d.ts)",
+      "Bash(tasklist /fi \"imagename eq node.exe\")",
+      "Bash(xargs grep:*)",
+      "Bash(grep -A 10 \"type SayFn\\\\|interface SayFn\" node_modules/@slack/bolt/dist/types/*.d.ts)",
+      "Bash(pkill -f \"node app.js\")",
+      "Bash(taskkill /F /IM node.exe)",
+      "Bash(pkill -9 node)",
+      "Bash(cmd /c \"taskkill /F /IM node.exe\")",
+      "Bash(ngrok version:*)",
+      "Bash(npx ngrok:*)"
     ]
   }
 }

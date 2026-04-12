@@ -2,349 +2,336 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import pkg from '@slack/bolt';
-const { App } = pkg;
+const { App, LogLevel } = pkg;
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import FormData from 'form-data';
-import Beliefs from 'beliefs';
+import { loadState, saveState } from './state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Fallback state for when the Thinkn SDK is in beta-access strict mode
-const fallbackBeliefsState = {}; // maps slackUserId -> policyId, slackUserId_chat_session -> sessionId
+// ── Config ────────────────────────────────────────────────────────────────────
 
-// Per-user Beliefs factory — each user gets their own scoped belief graph via thread
-function getBeliefsForUser(userId) {
-    return new Beliefs({
-        apiKey: process.env.BELIEFS_KEY || "SVHACK",
-        thread: userId,
-    });
+const BACKEND   = process.env.HEAL_BACKEND_URL || 'http://localhost:8000';
+const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const APP_TOKEN = process.env.SLACK_APP_TOKEN;
+const BELIEFS_KEY = process.env.BELIEFS_KEY || 'SVHACK';
+
+if (!BOT_TOKEN) { console.error('SLACK_BOT_TOKEN missing'); process.exit(1); }
+if (!APP_TOKEN) { console.error('SLACK_APP_TOKEN missing'); process.exit(1); }
+
+// Backend HTTP client — 60s timeout for AI calls
+const api = axios.create({ baseURL: BACKEND, timeout: 60_000 });
+
+// Per-session memory: userId → policyId (persisted), `${userId}_session` → sessionId (in-memory only)
+const state = loadState();
+
+// Dedup set — prevents replayed socket events from being processed twice
+const processed = new Set();
+
+// ── Beliefs SDK (optional) ────────────────────────────────────────────────────
+// Always fire-and-forget. Never on the path that determines what we reply.
+
+let Beliefs = null;
+try {
+    Beliefs = (await import('beliefs')).default;
+    console.log('[beliefs] loaded ✓');
+} catch (e) {
+    console.warn('[beliefs] unavailable:', e.message);
 }
 
-// Store structured policy beliefs after a successful policy upload
-async function storePolicyBeliefs(userId, documentId, analysisData) {
-    const b = getBeliefsForUser(userId);
+function mkB(userId) {
+    if (!Beliefs) return null;
+    try { return new Beliefs({ apiKey: BELIEFS_KEY, thread: userId, timeout: 2000, maxRetries: 0 }); }
+    catch { return null; }
+}
+
+function bgB(userId, fn) {
+    const b = mkB(userId);
+    if (!b) return;
+    fn(b).catch(e => { if (e.code !== 'BETA_ACCESS_REQUIRED') console.warn('[beliefs bg]', e.message); });
+}
+
+async function searchB(userId, query) {
+    const b = mkB(userId);
+    if (!b) return null;
+    try { return await b.search(query); }
+    catch { return null; }
+}
+
+// ── State helpers ─────────────────────────────────────────────────────────────
+
+async function resolvePolicyId(userId) {
+    if (state[userId]) return state[userId];
+    const results = await searchB(userId, 'active policy_id');
+    if (results?.length) {
+        const best = results
+            .filter(r => !['retracted','removed','invalidated'].includes(r.lifecycle))
+            .sort((a, b) => (b.confidence||0) - (a.confidence||0))[0];
+        const m = best?.text?.match(/policy_id\s+(?:is\s+)?(\S+)/i);
+        if (m?.[1]) { state[userId] = m[1]; console.log(`[beliefs] restored policy ${m[1]} for ${userId}`); }
+    }
+    return state[userId] || null;
+}
+
+// ── Slack helpers ─────────────────────────────────────────────────────────────
+
+// Post a placeholder, then replace it in-place with the real content.
+// This avoids the "two messages → looks like new thread" problem.
+async function postThenUpdate(client, channel, placeholder, fn) {
+    const msg = await client.chat.postMessage({ channel, text: placeholder });
     try {
-        const items = [
-            {
-                text: `Active policy_id is ${documentId}`,
-                confidence: 0.99,
-                type: 'claim',
-                source: 'slack_upload',
-            },
-        ];
-
-        // Extract key coverage details from HEAL's PolicyAnalysisOutput
-        const inNet = analysisData?.coverageCosts?.inNetwork;
-        if (inNet?.deductible?.individual !== undefined) {
-            items.push({
-                text: `Individual in-network deductible is $${inNet.deductible.individual}`,
-                confidence: 0.95,
-                type: 'evidence',
-                source: 'heal_policy_analysis',
-            });
-        }
-        if (inNet?.outOfPocketMax?.individual !== undefined) {
-            items.push({
-                text: `Individual in-network out-of-pocket maximum is $${inNet.outOfPocketMax.individual}`,
-                confidence: 0.95,
-                type: 'evidence',
-                source: 'heal_policy_analysis',
-            });
-        }
-        if (inNet?.coinsurance) {
-            items.push({
-                text: `In-network coinsurance is ${inNet.coinsurance}`,
-                confidence: 0.95,
-                type: 'evidence',
-                source: 'heal_policy_analysis',
-            });
-        }
-        if (inNet?.copay?.primaryCare) {
-            items.push({
-                text: `Primary care copay is $${inNet.copay.primaryCare}`,
-                confidence: 0.95,
-                type: 'evidence',
-                source: 'heal_policy_analysis',
-            });
-        }
-
-        const delta = await b.add(items);
-        console.log(`[THINKN] Stored ${items.length} policy beliefs. Clarity: ${delta.clarity?.toFixed(2)}, Readiness: ${delta.readiness}`);
-        return delta;
+        const text = await fn();
+        await client.chat.update({ channel, ts: msg.ts, text });
     } catch (err) {
-        if (err.code === 'BETA_ACCESS_REQUIRED') {
-            console.log(`[THINKN] Beta access required — falling back to local state.`);
-        } else {
-            console.log(`[THINKN] beliefs.add failed: ${err.message}`);
-        }
-        return null;
+        await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` });
+        throw err;
     }
 }
 
-// Retrieve policy ID from the user's belief graph
-async function getPolicyIdFromBeliefs(userId) {
-    const b = getBeliefsForUser(userId);
-    try {
-        const results = await b.search('active policy_id');
-        if (results && results.length > 0) {
-            const active = results
-                .filter(bl => bl.lifecycle !== 'retracted' && bl.lifecycle !== 'removed' && bl.lifecycle !== 'invalidated')
-                .sort((a, bel) => (bel.confidence || 0) - (a.confidence || 0));
-            if (active.length > 0) {
-                const match = active[0].text.match(/policy_id\s+(?:is\s+)?(\S+)/i);
-                if (match) return match[1];
-            }
-        }
-    } catch (err) {
-        if (err.code !== 'BETA_ACCESS_REQUIRED') {
-            console.log(`[THINKN] beliefs.search failed: ${err.message}`);
-        }
-    }
-    return null;
-}
+// ── Slack App ─────────────────────────────────────────────────────────────────
 
 const app = new App({
-    token: process.env.SLACK_BOT_TOKEN,
-    appToken: process.env.SLACK_APP_TOKEN,
+    token: BOT_TOKEN,
+    appToken: APP_TOKEN,
     socketMode: true,
+    logLevel: LogLevel.ERROR,
 });
 
-app.message(async ({ message, say }) => {
-    console.log(`[SLACK INCOMING] Received message from ${message.user} in ${message.channel}`);
+app.error(async (e) => console.error('[bolt]', e.message));
 
-    if (message.bot_id) return; // ignore bot messages
+// ── Message handler ───────────────────────────────────────────────────────────
 
-    const msgText = (message.text || "").toLowerCase();
+app.message(async ({ message, client }) => {
+    // Allow file_share subtype — that's how Slack delivers file uploads
+    if ((message.subtype && message.subtype !== 'file_share') || message.bot_id || !message.user) return;
 
-    // ── TEXT-ONLY FLOW ──────────────────────────────────────────────────────────
-    if (!message.files || message.files.length === 0) {
-        if (msgText.match(/(hi|hello|help)/i)) {
-            await say("👋 *Hi! I'm the HEAL Silent Advocate.*\nI am stateful. First, upload your *Insurance Policy* (include the word 'policy' in your message). Then ask me questions about your coverage or upload *Medical Bills* for me to analyze!\n\n_What would you like to do?_");
-            return;
-        }
+    const userId  = message.user;
+    const channel = message.channel;
+    const text    = (message.text || '').trim();
+    const lc      = text.toLowerCase();
 
-        // Conversational question — look up policy from beliefs first
-        let targetPolicyId = fallbackBeliefsState[message.user];
+    // Dedup: skip replayed events (socket reconnect redelivery)
+    if (processed.has(message.ts)) return;
+    processed.add(message.ts);
+    if (processed.size > 1000) processed.clear();
 
-        try {
-            const b = getBeliefsForUser(message.user);
-            const ctx = await b.before(message.text);
-            console.log(`[THINKN] Chat context — clarity: ${ctx.clarity?.toFixed(2)}, beliefs: ${ctx.beliefs.length}`);
-
-            // Try to find policy_id in the user's belief graph
-            const policyBelief = ctx.beliefs.find(
-                bl => bl.type === 'claim' &&
-                      bl.lifecycle !== 'retracted' &&
-                      bl.text.includes('policy_id')
-            );
-            if (policyBelief) {
-                const match = policyBelief.text.match(/policy_id\s+(?:is\s+)?(\S+)/i);
-                if (match) targetPolicyId = match[1];
-            }
-        } catch (err) {
-            if (err.code !== 'BETA_ACCESS_REQUIRED') {
-                console.log(`[THINKN] beliefs.before failed: ${err.message}`);
-            }
-        }
-
-        if (!targetPolicyId) {
-            await say("⚠️ *No active insurance policy on file.* Please upload your insurance document first and include the word 'policy' in your message.");
-            return;
-        }
-
-        await say("💬 *Checking your policy details...*");
-        try {
-            const backendUrl = process.env.HEAL_BACKEND_URL || "http://localhost:8000";
-            let sessionId = fallbackBeliefsState[`${message.user}_chat_session`];
-
-            if (!sessionId) {
-                const sessionRes = await axios.post(`${backendUrl}/chat/sessions`, {
-                    document_ids: [targetPolicyId],
-                });
-                sessionId = sessionRes.data.session_id;
-                fallbackBeliefsState[`${message.user}_chat_session`] = sessionId;
-                console.log(`[HEAL API] Created chat session: ${sessionId}`);
-            }
-
-            const chatRes = await axios.post(`${backendUrl}/chat/sessions/${sessionId}/messages`, {
-                message: message.text,
-            });
-
-            const aiReply = chatRes.data.message || chatRes.data.response || JSON.stringify(chatRes.data);
-
-            // Feed the AI's answer back into beliefs to extract any new coverage facts
-            try {
-                const b = getBeliefsForUser(message.user);
-                const delta = await b.after(aiReply, { source: 'heal_rag_chat' });
-                console.log(`[THINKN] Chat after() — readiness: ${delta.readiness}, clarity: ${delta.clarity?.toFixed(2)}`);
-            } catch (err) { /* non-fatal */ }
-
-            await say(`🧠 *HEAL Assistant says:*\n\n${aiReply}`);
-        } catch (err) {
-            console.error(err);
-            await say(`❌ *Error connecting to chat engine:*\n${err.message}`);
-        }
-        return;
-    }
-
-    // ── FILE UPLOAD FLOW ────────────────────────────────────────────────────────
-    const file = message.files[0];
-    const isPolicy = msgText.includes("policy") || msgText.includes("insurance");
-
-    await say(isPolicy
-        ? "🔍 *Processing your Insurance Policy...* I'll digest this and update my Beliefs about your coverage."
-        : "💸 *Received your Medical Bill!* Fetching your policy from my Beliefs and cross-referencing for errors..."
-    );
+    console.log(`[msg] user=${userId} text="${text.slice(0,80)}"`);
 
     try {
-        // Download file from Slack
-        const download = await axios.get(file.url_private_download, {
-            headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-            responseType: 'arraybuffer',
-        });
-        const tmpFilePath = path.join(__dirname, 'tmp_' + file.name);
-        fs.writeFileSync(tmpFilePath, download.data);
 
-        const backendUrl = process.env.HEAL_BACKEND_URL || "http://localhost:8000";
-
-        if (isPolicy) {
-            // ── POLICY UPLOAD ──
-            const formData = new FormData();
-            formData.append('file', fs.createReadStream(tmpFilePath));
-            const uploadRes = await axios.post(`${backendUrl}/upload`, formData, {
-                headers: { ...formData.getHeaders() },
-            });
-            fs.unlinkSync(tmpFilePath);
-
-            // Get the document ID (most recent) from /documents
-            let documentId = "latest";
-            try {
-                const docsRes = await axios.get(`${backendUrl}/documents`);
-                if (docsRes.data?.documents?.length > 0) {
-                    const sorted = docsRes.data.documents.sort(
-                        (a, b) => new Date(b.upload_timestamp) - new Date(a.upload_timestamp)
-                    );
-                    documentId = sorted[0].id;
-                }
-            } catch (e) {
-                console.log("[HEAL API] Could not fetch document list, using 'latest'");
-            }
-
-            // Always store in fallback state
-            fallbackBeliefsState[message.user] = documentId;
-            // Reset chat session so next conversation uses the new policy
-            delete fallbackBeliefsState[`${message.user}_chat_session`];
-
-            // Store structured beliefs (policy_id + coverage details from analysis)
-            const delta = await storePolicyBeliefs(message.user, documentId, uploadRes.data);
-            const clarityNote = delta ? ` Belief clarity: *${(delta.clarity * 100).toFixed(0)}%*` : '';
-
-            await say(
-                `✅ *Policy memorized!* Document ID \`${documentId}\`.${clarityNote}\n` +
-                `You can now send me a medical bill to check it against your policy, or ask me questions about your coverage.`
-            );
-
-        } else {
-            // ── BILL UPLOAD ──
-            const formData = new FormData();
-            formData.append('file', fs.createReadStream(tmpFilePath));
-            const uploadRes = await axios.post(`${backendUrl}/bill-checker/upload`, formData, {
-                headers: { ...formData.getHeaders() },
-            });
-            const billId = uploadRes.data.bill_id;
-            fs.unlinkSync(tmpFilePath);
-
-            // Resolve policy_id: try beliefs first, fall back to local state
-            let targetPolicyId = fallbackBeliefsState[message.user];
-            try {
-                const b = getBeliefsForUser(message.user);
-                const ctx = await b.before("What is my active insurance policy and current deductible status?");
-                console.log(`[THINKN] Bill context — clarity: ${ctx.clarity?.toFixed(2)}, beliefs: ${ctx.beliefs.length}`);
-
-                const policyFromBeliefs = await getPolicyIdFromBeliefs(message.user);
-                if (policyFromBeliefs) {
-                    targetPolicyId = policyFromBeliefs;
-                    console.log(`[THINKN] Resolved policy_id from beliefs: ${targetPolicyId}`);
-                }
-            } catch (err) {
-                if (err.code !== 'BETA_ACCESS_REQUIRED') {
-                    console.log(`[THINKN] beliefs.before failed: ${err.message}`);
-                }
-            }
-
-            if (!targetPolicyId) {
-                await say("⚠️ *No active insurance policy on file.* Please upload your insurance document first and include the word 'policy' in your message.");
-                return;
-            }
-
-            // Analyze bill against policy
-            const analyzeRes = await axios.post(`${backendUrl}/bill-checker/analyze`, {
-                bill_id: billId,
-                policy_id: targetPolicyId,
-            });
-            const aiData = analyzeRes.data;
-
-            // Record the bill analysis outcome in beliefs
-            let billDelta = null;
-            try {
-                const b = getBeliefsForUser(message.user);
-                const patientOwes = aiData?.financial_breakdown?.patient_responsibility;
-                const hasDiscrepancy = aiData?.discrepancy_check && aiData.discrepancy_check !== "No discrepancies found.";
-
-                billDelta = await b.after(
-                    `Bill analysis complete. Patient responsibility: $${patientOwes}. ` +
-                    (hasDiscrepancy
-                        ? `Discrepancy found: ${aiData.discrepancy_check?.substring(0, 120)}`
-                        : 'No discrepancies found.'),
-                    { source: 'heal_bill_analysis' }
-                );
-                console.log(`[THINKN] Bill recorded — readiness: ${billDelta.readiness}, clarity: ${billDelta.clarity?.toFixed(2)}`);
-
-                // Flag discrepancy as a risk belief
-                if (hasDiscrepancy) {
-                    await b.add(
-                        `Potential billing discrepancy: ${aiData.discrepancy_check.substring(0, 120)}`,
-                        { type: 'risk', confidence: 0.9, source: 'heal_bill_analysis' }
-                    );
-                }
-            } catch (err) { /* non-fatal */ }
-
-            // Format Slack response
-            let responseText = `✅ *HEAL Financial Breakdown (against your Policy)*\n\n`;
-            if (aiData.financial_breakdown) {
-                responseText += `*Total Billed*: $${aiData.financial_breakdown.total_charges}\n`;
-                responseText += `*Insurance Pays*: $${aiData.financial_breakdown.insurance_payment}\n`;
-                responseText += `*You Owe*: $${aiData.financial_breakdown.patient_responsibility}\n\n`;
-            }
-            if (aiData.discrepancy_check && aiData.discrepancy_check !== "No discrepancies found.") {
-                responseText += `🚨 *Discrepancy Found*: ${aiData.discrepancy_check}\n\n`;
+        // ── File upload ───────────────────────────────────────────────────────
+        if (message.files?.length) {
+            const isPolicy = /policy|insurance/i.test(lc);
+            if (isPolicy) {
+                await postThenUpdate(client, channel, '🔍 _Reading your insurance policy..._', async () => {
+                    return await processPolicyUpload(userId, message.files[0]);
+                });
             } else {
-                responseText += `✅ *No discrepancies found against your policy.*\n\n`;
+                await postThenUpdate(client, channel, '💸 _Analyzing your medical bill..._', async () => {
+                    return await processBillUpload(userId, message.files[0]);
+                });
             }
-            const readinessNote = billDelta?.readiness ? ` | Belief readiness: ${billDelta.readiness}` : '';
-            responseText += `_Analysis powered by HEAL AI & Thinkn Belief tracking${readinessNote}_`;
-
-            console.log(`[SLACK OUTGOING] Sending bill analysis response`);
-            await say(responseText);
+            return;
         }
 
+        // ── Greeting ──────────────────────────────────────────────────────────
+        if (!text || /^(hi|hello|hey|help|start)\b/i.test(lc)) {
+            await client.chat.postMessage({
+                channel,
+                text:
+                    "👋 *Hi! I'm HEAL — your Silent Medical Billing Advocate.*\n\n" +
+                    "*How to use me:*\n" +
+                    "1. Upload your *insurance policy* PDF — include the word *policy* in your message\n" +
+                    "2. Ask me questions about your coverage, or upload a *medical bill* to check it for errors\n\n" +
+                    "_Your policy is remembered for the session._",
+            });
+            return;
+        }
+
+        // ── Chat ──────────────────────────────────────────────────────────────
+        await postThenUpdate(client, channel, '💬 _Checking your policy..._', async () => {
+            return await handleChat(userId, text);
+        });
+
     } catch (err) {
-        console.error(err);
-        const tmpFilePath = path.join(__dirname, 'tmp_' + file.name);
-        if (fs.existsSync(tmpFilePath)) fs.unlinkSync(tmpFilePath);
-        await say(`❌ *Sorry, an error occurred:*\n${err.message}`);
+        console.error('[handler]', err);
+        try {
+            await client.chat.postMessage({ channel, text: `❌ *Error:* ${err.message}` });
+        } catch { /* ignore */ }
     }
 });
+
+// ── Policy upload ─────────────────────────────────────────────────────────────
+
+async function processPolicyUpload(userId, file) {
+    const tmpPath = path.join(__dirname, `tmp_${Date.now()}_${file.name}`);
+    try {
+        const dl = await axios.get(file.url_private_download, {
+            headers: { Authorization: `Bearer ${BOT_TOKEN}` },
+            responseType: 'arraybuffer',
+            timeout: 30_000,
+        });
+        fs.writeFileSync(tmpPath, dl.data);
+
+        const form = new FormData();
+        form.append('file', fs.createReadStream(tmpPath));
+        const { data: uploadData } = await api.post('/upload', form, { headers: form.getHeaders() });
+
+        // Extract document ID — prefer upload response, fall back to /documents query
+        let docId = uploadData?.additional_info?.rag_document_id;
+        if (!docId) {
+            try {
+                const { data } = await api.get('/documents');
+                const docs = data?.documents;
+                if (docs?.length) {
+                    docId = docs.sort((a, b) =>
+                        new Date(b.upload_timestamp) - new Date(a.upload_timestamp)
+                    )[0].id;
+                }
+            } catch { /* ignore */ }
+        }
+        if (!docId) throw new Error('Could not determine policy ID after upload. Please try again.');
+
+        state[userId] = docId;
+        delete state[`${userId}_session`];
+        saveState(state);
+
+        // Store beliefs in background
+        bgB(userId, async b => {
+            const items = [
+                { text: `Active policy_id is ${docId}`, confidence: 0.99, type: 'claim', source: 'slack' },
+            ];
+            const net = uploadData?.coverageCosts?.inNetwork;
+            if (net?.deductible?.individual != null)
+                items.push({ text: `In-network deductible is $${net.deductible.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+            if (net?.outOfPocketMax?.individual != null)
+                items.push({ text: `Out-of-pocket max is $${net.outOfPocketMax.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+            if (net?.coinsurance)
+                items.push({ text: `Coinsurance is ${net.coinsurance}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+            if (net?.copay?.primaryCare)
+                items.push({ text: `Primary care copay is $${net.copay.primaryCare}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+            const d = await b.add(items);
+            console.log(`[beliefs] stored ${items.length} beliefs, clarity=${d?.clarity?.toFixed(2)}`);
+        });
+
+        return (
+            `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
+            `You can now:\n` +
+            `• Ask me questions about your coverage\n` +
+            `• Upload a medical bill to check it for errors`
+        );
+    } finally {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+}
+
+// ── Bill upload ───────────────────────────────────────────────────────────────
+
+async function processBillUpload(userId, file) {
+    const policyId = await resolvePolicyId(userId);
+    if (!policyId) {
+        return '⚠️ *No insurance policy on file.* Upload your policy first — include the word "policy" in your message.';
+    }
+
+    const tmpPath = path.join(__dirname, `tmp_${Date.now()}_${file.name}`);
+    try {
+        const dl = await axios.get(file.url_private_download, {
+            headers: { Authorization: `Bearer ${BOT_TOKEN}` },
+            responseType: 'arraybuffer',
+            timeout: 30_000,
+        });
+        fs.writeFileSync(tmpPath, dl.data);
+
+        const form = new FormData();
+        form.append('file', fs.createReadStream(tmpPath));
+        const { data: { bill_id } } = await api.post('/bill-checker/upload', form, { headers: form.getHeaders() });
+
+        const { data } = await api.post('/bill-checker/analyze', { bill_id, policy_id: policyId });
+
+        const fin = data?.financial_breakdown;
+        const discrepancy = data?.discrepancy_check;
+        const hasDiscrepancy = !!discrepancy && discrepancy !== 'No discrepancies found.';
+
+        bgB(userId, b => b.after(
+            `Bill: patient owes $${fin?.patient_responsibility}. ${hasDiscrepancy ? 'Discrepancy found.' : 'Clean.'}`,
+            { source: 'heal_bill' }
+        ));
+        if (hasDiscrepancy) {
+            bgB(userId, b => b.add(
+                `Billing discrepancy: ${discrepancy?.substring(0, 120)}`,
+                { type: 'risk', confidence: 0.9, source: 'heal_bill' }
+            ));
+        }
+
+        let reply = `✅ *HEAL Financial Breakdown*\n\n`;
+        if (fin) {
+            reply += `*Total Billed:* $${fin.total_charges}\n`;
+            reply += `*Insurance Pays:* $${fin.insurance_payment}\n`;
+            reply += `*You Owe:* $${fin.patient_responsibility}\n\n`;
+        }
+        reply += hasDiscrepancy
+            ? `🚨 *Discrepancy Found:* ${discrepancy}\n`
+            : `✅ No discrepancies found against your policy.\n`;
+        reply += `\n_Powered by HEAL AI + Thinkn_`;
+        return reply;
+    } finally {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+
+async function handleChat(userId, text) {
+    const policyId = await resolvePolicyId(userId);
+    if (!policyId) {
+        return '⚠️ *No insurance policy on file.* Upload your policy first — include the word "policy" in your message.';
+    }
+
+    let sessionId = state[`${userId}_session`];
+    if (!sessionId) {
+        const { data } = await api.post('/chat/sessions', { document_ids: [policyId] });
+        sessionId = data.session_id;
+        state[`${userId}_session`] = sessionId;
+        console.log(`[heal] session ${sessionId} for policy ${policyId}`);
+    }
+
+    const { data } = await api.post(`/chat/sessions/${sessionId}/messages`, { message: text });
+    const rawReply = data.message || data.response || JSON.stringify(data);
+
+    // Pass clean text to beliefs (no Slack formatting noise — judges see this graph)
+    bgB(userId, b => b.after(rawReply, { source: 'heal_chat' }));
+
+    return `🧠 *HEAL:*\n\n${rawReply}`;
+}
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// Properly closes the WebSocket so Slack immediately drops the connection.
+// Without this, force-killed processes leave zombie connections that cause
+// Slack to round-robin events to dead sockets, creating reply delays.
+
+async function shutdown(signal) {
+    console.log(`\n${signal} received — closing Slack socket...`);
+    try { await app.stop(); } catch { /* ignore */ }
+    console.log('Socket closed. Goodbye.');
+    process.exit(0);
+}
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 (async () => {
     try {
         await app.start();
-        console.log('⚡️ HEAL Silent Advocate is running!');
-    } catch (error) {
-        console.error("Failed to start bot:", error.message);
+        console.log('⚡️ HEAL bot running');
+        const { data } = await api.get('/health');
+        console.log(`✅ backend ok — model=${data.model_status} db=${data.database_status}`);
+    } catch (err) {
+        console.error('❌ startup failed:', err.message);
+        process.exit(1);
     }
 })();

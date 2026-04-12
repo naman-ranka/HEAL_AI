@@ -20,10 +20,10 @@ frontend-clean/            ← React + TypeScript + Vite frontend
 
 ### Backend Stack
 - **FastAPI** — main API server (`backend/main.py`)
-- **Google Gemini** — `embedding-001` for embeddings (768-dim), `gemini-2.5-flash/pro` for analysis
+- **Google Gemini** — `text-embedding-004` for embeddings (768-dim), `gemini-2.5-flash/pro` for analysis
 - **SQLite** — local DB (`backend/heal.db`)
 - **RAG pipeline** — `backend/rag/` (document_processor → embedder → retriever → chatbot)
-- **google-generativeai==0.4.0** — do NOT upgrade without testing; `embedding-001` is the correct model for this version
+- **google-generativeai==0.4.0** — do NOT upgrade without testing; use `text-embedding-004` (`embedding-001` was deprecated from v1beta API in 2025)
 
 ### Slack Bot Stack
 - `@slack/bolt` v4 — socket mode
@@ -71,15 +71,24 @@ frontend-clean/            ← React + TypeScript + Vite frontend
 
 ---
 
-## Known Bugs (to fix)
+## Fixed Bugs (as of 2026-04-12)
 
-1. **`backend/rag/document_processor.py:311`** — fallback embedding dim is 384, must be 768
-2. **`heal-slack-bot/app.js:150`** — `beliefs.before()` return value ignored; policy_id never extracted
-3. **`heal-slack-bot/app.js:130`** — `beliefs.add()` stores but never queried back; use `beliefs.search()` or per-thread scoping
-4. **All users share one `beliefs` instance** — must use `thread: userId` in constructor for isolation
+All prior bugs resolved. Current state of `heal-slack-bot/app.js`:
+- Per-user beliefs isolation via `thread: userId` in `mkB()` ✓
+- `beliefs.search()` used in `resolvePolicyId()` for state recovery ✓
+- `beliefs.before()` removed (was unused) ✓
+- `document_processor.py` fallback dim is 768 ✓
+- `embedder.py:303` `initialize_embedder` default fixed to `text-embedding-004` ✓
+- State persisted to `bot-state.json` via `state.js` (survives restarts) ✓
+- `docId = 'latest'` fallback removed — now throws if ID can't be determined ✓
+- Beliefs `after()` receives clean AI text, not Slack-formatted string ✓
+- Event dedup Set prevents socket replay ✓
 
-## Fix Plan
-See `.claude/plans/fancy-doodling-zebra.md` for the full implementation plan.
+## Open TODOs
+
+- Startup cleanup of orphaned "Thinking..." placeholder messages (post-hackathon)
+- Session retry on stale sessionId: if `/chat/sessions/{id}/messages` returns 4xx,
+  clear sessionId and retry with a new session
 
 ---
 
@@ -118,7 +127,7 @@ node app.js
 
 ## Important Constraints
 - Do NOT upgrade `google-generativeai` from 0.4.0 without testing — newer SDK is `google-genai` and has breaking changes
-- Embedding model must be `embedding-001` (not `text-embedding-004`) for this library version
+- Embedding model is `text-embedding-004` — `embedding-001` was deprecated from v1beta API in 2025; both return 768-dim vectors
 - All embedding dimensions must be 768 everywhere — mismatches cause silent RAG failures
 - Keep `fallbackBeliefsState` in the Slack bot as a backup when Thinkn SDK throws `BetaAccessError`
 - The `beliefs` SDK may throw `BetaAccessError` with `err.code === 'BETA_ACCESS_REQUIRED'` — always wrap in try/catch

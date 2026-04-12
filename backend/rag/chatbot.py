@@ -146,7 +146,7 @@ class InsuranceChatbot:
                 confidence=confidence,
                 session_id=session_id,
                 processing_time_ms=processing_time,
-                model_used='gemini-2.5-pro',
+                model_used='gemini-2.5-flash',
                 tokens_used=None  # Would be available in real Genkit implementation
             )
             
@@ -260,7 +260,7 @@ class InsuranceChatbot:
             prompt = self._build_conversational_rag_prompt(user_message, context, conversation_history)
             
             # Generate response using Gemini
-            model = ai_config.get_model('pro')
+            model = ai_config.get_model('flash')
             response = model.generate_content(prompt)
             
             return response.text
@@ -485,7 +485,7 @@ NEXT STEPS:
                 content,
                 json.dumps(relevant_chunks) if relevant_chunks else None,
                 confidence_score,
-                'gemini-2.5-pro' if message_type == 'assistant' else None,
+                'gemini-2.5-flash' if message_type == 'assistant' else None,
                 processing_time_ms
             ))
             conn.commit()

@@ -129,7 +129,7 @@ class GeminiService:
                     raise Exception("PDF processing failed")
                 
                 # Get pro model for PDF analysis
-                model = self._get_model('pro')
+                model = self._get_model('flash')
                 
                 # Generate content
                 response = model.generate_content([prompt, uploaded_file])
@@ -186,7 +186,7 @@ class GeminiService:
         """
         try:
             # Get pro model for text analysis
-            model = self._get_model('pro')
+            model = self._get_model('flash')
             
             # Combine prompt and text
             full_prompt = f"{prompt}\n\nDocument content:\n{text}"
@@ -213,7 +213,7 @@ class GeminiService:
         """
         try:
             # Get pro model for chat
-            model = self._get_model('pro')
+            model = self._get_model('flash')
             
             # Start chat session
             chat = model.start_chat(history=chat_history or [])

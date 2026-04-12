@@ -40,8 +40,8 @@ class GeminiEmbedder:
     Provides semantic embeddings with fallback to hash-based embeddings
     """
     
-    def __init__(self, 
-                 model_name: str = "embedding-001",
+    def __init__(self,
+                 model_name: str = "gemini-embedding-2-preview",
                  dimension: int = 768,
                  enable_fallback: bool = True):
         """
@@ -182,40 +182,69 @@ class GeminiEmbedder:
         
         return results
     
-    async def _generate_gemini_embedding(self, 
-                                       text: str, 
+    async def _generate_gemini_embedding(self,
+                                       text: str,
                                        task_type: EmbeddingTaskType) -> EmbeddingResult:
-        """Generate embedding using Gemini API"""
-        try:
-            # Use the embed_content method from google-generativeai
-            result = genai.embed_content(
-                model=f"models/{self.model_name}",
-                content=text,
-                task_type=task_type.value
+        """Generate embedding via Gemini v1beta REST API.
+
+        Uses requests directly so we can pass outputDimensionality=768,
+        which keeps vectors compatible with the existing database schema.
+        Available models on this endpoint: gemini-embedding-2-preview.
+        """
+        import os
+        import requests as _requests
+
+        _TASK_TYPE_MAP = {
+            "retrieval_query":     "RETRIEVAL_QUERY",
+            "retrieval_document":  "RETRIEVAL_DOCUMENT",
+            "semantic_similarity": "SEMANTIC_SIMILARITY",
+            "classification":      "CLASSIFICATION",
+        }
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return EmbeddingResult(
+                embedding=np.zeros(self.dimension),
+                model_used=self.model_name,
+                execution_time_ms=0,
+                success=False,
+                error_message="GEMINI_API_KEY not set"
             )
-            
-            embedding_vector = np.array(result['embedding'], dtype=np.float32)
-            
-            # Validate embedding dimension
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model_name}:embedContent?key={api_key}"
+        )
+        payload = {
+            "model": f"models/{self.model_name}",
+            "content": {"parts": [{"text": text}]},
+            "taskType": _TASK_TYPE_MAP.get(task_type.value, "RETRIEVAL_DOCUMENT"),
+            "outputDimensionality": self.dimension,
+        }
+
+        try:
+            resp = _requests.post(url, json=payload, timeout=30)
+            resp.raise_for_status()
+            values = resp.json()["embedding"]["values"]
+            embedding_vector = np.array(values, dtype=np.float32)
+
             if len(embedding_vector) != self.dimension:
                 logger.warning(f"⚠️ Unexpected embedding dimension: {len(embedding_vector)} != {self.dimension}")
-                # Pad or truncate to expected dimension
                 if len(embedding_vector) < self.dimension:
                     embedding_vector = np.pad(embedding_vector, (0, self.dimension - len(embedding_vector)))
                 else:
                     embedding_vector = embedding_vector[:self.dimension]
-            
+
             return EmbeddingResult(
                 embedding=embedding_vector,
                 model_used=self.model_name,
-                execution_time_ms=0,  # Will be set by caller
+                execution_time_ms=0,
                 success=True
             )
-            
+
         except Exception as e:
             error_msg = f"Gemini API error: {str(e)}"
             logger.error(f"❌ {error_msg}")
-            
             return EmbeddingResult(
                 embedding=np.zeros(self.dimension),
                 model_used=self.model_name,
@@ -300,7 +329,7 @@ def get_embedder() -> GeminiEmbedder:
         _embedder = GeminiEmbedder()
     return _embedder
 
-def initialize_embedder(model_name: str = "embedding-001", 
+def initialize_embedder(model_name: str = "gemini-embedding-2-preview",
                        dimension: int = 768,
                        enable_fallback: bool = True) -> GeminiEmbedder:
     """Initialize the global embedder with custom settings"""
