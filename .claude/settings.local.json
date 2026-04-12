@@ -18,7 +18,9 @@
       "Skill(plan-ceo-review:*)",
       "Bash(~/.claude/skills/gstack/bin/gstack-config get:*)",
       "Bash(~/.claude/skills/gstack/bin/gstack-timeline-log '{\"skill\":\"plan-ceo-review\",\"event\":\"completed\",\"branch\":\"hackathon-thinkn-uchenova\",\"outcome\":\"success\",\"session\":\"2163-1775995543\"}')",
-      "Bash(~/.claude/skills/gstack/bin/gstack-review-log '{\"skill\":\"plan-ceo-review\",\"timestamp\":\"2026-04-12T12:30:00Z\",\"status\":\"clean\",\"unresolved\":0,\"critical_gaps\":0,\"mode\":\"SCOPE_EXPANSION\",\"scope_proposed\":4,\"scope_accepted\":4,\"scope_deferred\":0,\"commit\":\"unknown\"}')"
+      "Bash(~/.claude/skills/gstack/bin/gstack-review-log '{\"skill\":\"plan-ceo-review\",\"timestamp\":\"2026-04-12T12:30:00Z\",\"status\":\"clean\",\"unresolved\":0,\"critical_gaps\":0,\"mode\":\"SCOPE_EXPANSION\",\"scope_proposed\":4,\"scope_accepted\":4,\"scope_deferred\":0,\"commit\":\"unknown\"}')",
+      "Skill(qa)",
+      "Skill(qa:*)"
     ]
   }
 }
