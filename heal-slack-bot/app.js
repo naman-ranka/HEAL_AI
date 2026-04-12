@@ -13,6 +13,28 @@ import { loadState, saveState } from './state.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+const NUM_EMOJIS = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'];
+
+/** Parse AI findings like "**1. TITLE:** text.. **2. TITLE:** text" into clean Slack blocks */
+function formatFindings(str) {
+    if (!str) return '';
+    // Split on bold numbered headers: **1. TITLE:**
+    const parts = str.split(/\*\*\d+\.\s+/).filter(Boolean);
+    if (parts.length < 2) return str.replace(/\*\*/g, '*').replace(/\.\.\s*/g, '\n').trim();
+
+    return parts.map((part, i) => {
+        const sep = part.indexOf(':**');
+        if (sep === -1) return `${NUM_EMOJIS[i] || `${i+1}.`} ${part.replace(/\*\*/g, '*').replace(/\.\.\s*/g, '').trim()}`;
+        const title = part.slice(0, sep).trim();
+        const body  = part.slice(sep + 3).replace(/\.\.\s*$/, '').trim();
+        return `${NUM_EMOJIS[i] || `${i+1}.`} *${title}*\n${body}`;
+    }).join('\n\n');
+}
+
+function fmt$(n) { return n != null ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'; }
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BACKEND   = process.env.HEAL_BACKEND_URL || 'http://localhost:8000';
@@ -127,13 +149,21 @@ app.message(async ({ message, client }) => {
         if (message.files?.length) {
             const isPolicy = /policy|insurance/i.test(lc);
             if (isPolicy) {
-                await postThenUpdate(client, channel, '🔍 _Reading your insurance policy..._', async () => {
-                    return await processPolicyUpload(userId, message.files[0]);
-                });
+                // Fire-and-forget: post placeholder immediately, update as stages complete
+                const msg = await client.chat.postMessage({ channel, text: '📤 _Uploading your policy..._' });
+                processPolicyUploadAsync(userId, message.files[0], client, channel, msg.ts)
+                    .catch(async err => {
+                        console.error('[policy-upload]', err.message);
+                        try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
+                    });
             } else {
-                await postThenUpdate(client, channel, '💸 _Analyzing your medical bill..._', async () => {
-                    return await processBillUpload(userId, message.files[0]);
-                });
+                // Fire-and-forget: post placeholder immediately, poll backend for result
+                const msg = await client.chat.postMessage({ channel, text: '📤 _Uploading your bill..._' });
+                processBillUploadAsync(userId, message.files[0], client, channel, msg.ts)
+                    .catch(async err => {
+                        console.error('[bill-upload]', err.message);
+                        try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
+                    });
             }
             return;
         }
@@ -165,11 +195,17 @@ app.message(async ({ message, client }) => {
     }
 });
 
-// ── Policy upload ─────────────────────────────────────────────────────────────
+// ── Async policy upload (fire-and-forget with live Slack updates) ─────────────
 
-async function processPolicyUpload(userId, file) {
+const STAGE_MSGS = {
+    analyzing: '🧠 _Analyzing your coverage details..._',
+    indexing:  '📚 _Building your knowledge base..._',
+};
+
+async function processPolicyUploadAsync(userId, file, client, channel, ts) {
     const tmpPath = path.join(__dirname, `tmp_${Date.now()}_${file.name}`);
     try {
+        // Download file
         const dl = await axios.get(file.url_private_download, {
             headers: { Authorization: `Bearer ${BOT_TOKEN}` },
             responseType: 'arraybuffer',
@@ -177,68 +213,100 @@ async function processPolicyUpload(userId, file) {
         });
         fs.writeFileSync(tmpPath, dl.data);
 
+        // Kick off async job on backend — returns immediately
+        await client.chat.update({ channel, ts, text: '🔍 _Reading your insurance policy..._' });
         const form = new FormData();
         form.append('file', fs.createReadStream(tmpPath));
-        const { data: uploadData } = await api.post('/upload', form, { headers: form.getHeaders() });
+        const { data: { job_id } } = await api.post('/upload/async', form, { headers: form.getHeaders() });
 
-        // Extract document ID — prefer upload response, fall back to /documents query
-        let docId = uploadData?.additional_info?.rag_document_id;
-        if (!docId) {
-            try {
-                const { data } = await api.get('/documents');
-                const docs = data?.documents;
-                if (docs?.length) {
-                    docId = docs.sort((a, b) =>
-                        new Date(b.upload_timestamp) - new Date(a.upload_timestamp)
-                    )[0].id;
+        // Poll for completion, updating message on stage transitions
+        let lastStage = null;
+        const maxWait = 120_000;
+        const pollMs  = 3_000;
+        const started = Date.now();
+
+        while (Date.now() - started < maxWait) {
+            await new Promise(r => setTimeout(r, pollMs));
+            const { data: job } = await api.get(`/upload/status/${job_id}`);
+
+            if (job.status === 'done') {
+                let docId = job.result?.additional_info?.rag_document_id;
+                if (!docId) {
+                    try {
+                        const { data } = await api.get('/documents');
+                        const docs = data?.documents;
+                        if (docs?.length) {
+                            docId = docs.sort((a, b) =>
+                                new Date(b.upload_timestamp) - new Date(a.upload_timestamp)
+                            )[0].id;
+                        }
+                    } catch { /* ignore */ }
                 }
-            } catch { /* ignore */ }
+                if (!docId) throw new Error('Could not determine policy ID after upload. Please try again.');
+
+                state[userId] = docId;
+                delete state[`${userId}_session`];
+                saveState(state);
+
+                bgB(userId, async b => {
+                    const items = [
+                        { text: `Active policy_id is ${docId}`, confidence: 0.99, type: 'claim', source: 'slack' },
+                    ];
+                    const net = job.result?.coverageCosts?.inNetwork;
+                    if (net?.deductible?.individual != null)
+                        items.push({ text: `In-network deductible is $${net.deductible.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+                    if (net?.outOfPocketMax?.individual != null)
+                        items.push({ text: `Out-of-pocket max is $${net.outOfPocketMax.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+                    if (net?.coinsurance)
+                        items.push({ text: `Coinsurance is ${net.coinsurance}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+                    if (net?.copay?.primaryCare)
+                        items.push({ text: `Primary care copay is $${net.copay.primaryCare}`, confidence: 0.95, type: 'evidence', source: 'heal' });
+                    await b.add(items);
+                });
+
+                await client.chat.update({
+                    channel, ts,
+                    text:
+                        `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
+                        `You can now:\n` +
+                        `• Ask me questions about your coverage\n` +
+                        `• Upload a medical bill to check it for errors`,
+                });
+                return;
+            }
+
+            if (job.status === 'error') {
+                throw new Error(job.error || 'Policy processing failed. Please try again.');
+            }
+
+            // Still processing — update Slack only when stage changes
+            if (job.stage !== lastStage && STAGE_MSGS[job.stage]) {
+                lastStage = job.stage;
+                await client.chat.update({ channel, ts, text: STAGE_MSGS[job.stage] });
+            }
         }
-        if (!docId) throw new Error('Could not determine policy ID after upload. Please try again.');
 
-        state[userId] = docId;
-        delete state[`${userId}_session`];
-        saveState(state);
-
-        // Store beliefs in background
-        bgB(userId, async b => {
-            const items = [
-                { text: `Active policy_id is ${docId}`, confidence: 0.99, type: 'claim', source: 'slack' },
-            ];
-            const net = uploadData?.coverageCosts?.inNetwork;
-            if (net?.deductible?.individual != null)
-                items.push({ text: `In-network deductible is $${net.deductible.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
-            if (net?.outOfPocketMax?.individual != null)
-                items.push({ text: `Out-of-pocket max is $${net.outOfPocketMax.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
-            if (net?.coinsurance)
-                items.push({ text: `Coinsurance is ${net.coinsurance}`, confidence: 0.95, type: 'evidence', source: 'heal' });
-            if (net?.copay?.primaryCare)
-                items.push({ text: `Primary care copay is $${net.copay.primaryCare}`, confidence: 0.95, type: 'evidence', source: 'heal' });
-            const d = await b.add(items);
-            console.log(`[beliefs] stored ${items.length} beliefs, clarity=${d?.clarity?.toFixed(2)}`);
-        });
-
-        return (
-            `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
-            `You can now:\n` +
-            `• Ask me questions about your coverage\n` +
-            `• Upload a medical bill to check it for errors`
-        );
+        throw new Error('Policy processing timed out. Please try again.');
     } finally {
         try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     }
 }
 
-// ── Bill upload ───────────────────────────────────────────────────────────────
+// ── Bill upload (async polling with live Slack updates) ───────────────────────
 
-async function processBillUpload(userId, file) {
+async function processBillUploadAsync(userId, file, client, channel, ts) {
     const policyId = await resolvePolicyId(userId);
     if (!policyId) {
-        return '⚠️ *No insurance policy on file.* Upload your policy first — include the word "policy" in your message.';
+        await client.chat.update({
+            channel, ts,
+            text: '⚠️ *No insurance policy on file.* Upload your policy first — include the word "policy" in your message.',
+        });
+        return;
     }
 
     const tmpPath = path.join(__dirname, `tmp_${Date.now()}_${file.name}`);
     try {
+        // Download bill
         const dl = await axios.get(file.url_private_download, {
             headers: { Authorization: `Bearer ${BOT_TOKEN}` },
             responseType: 'arraybuffer',
@@ -246,38 +314,98 @@ async function processBillUpload(userId, file) {
         });
         fs.writeFileSync(tmpPath, dl.data);
 
+        // Upload bill file (fast)
+        await client.chat.update({ channel, ts, text: '💸 _Analyzing your medical bill..._' });
         const form = new FormData();
         form.append('file', fs.createReadStream(tmpPath));
         const { data: { bill_id } } = await api.post('/bill-checker/upload', form, { headers: form.getHeaders() });
 
-        const { data } = await api.post('/bill-checker/analyze', { bill_id, policy_id: policyId });
+        // Kick off async analysis — returns job_id immediately
+        const { data: { job_id } } = await api.post('/bill-checker/analyze/async', { bill_id, policy_id: policyId });
 
-        const fin = data?.financial_breakdown;
-        const discrepancy = data?.discrepancy_check;
-        const hasDiscrepancy = !!discrepancy && discrepancy !== 'No discrepancies found.';
+        // Poll for completion
+        const maxWait = 120_000;
+        const pollMs  = 3_000;
+        const started = Date.now();
 
-        bgB(userId, b => b.after(
-            `Bill: patient owes $${fin?.patient_responsibility}. ${hasDiscrepancy ? 'Discrepancy found.' : 'Clean.'}`,
-            { source: 'heal_bill' }
-        ));
-        if (hasDiscrepancy) {
-            bgB(userId, b => b.add(
-                `Billing discrepancy: ${discrepancy?.substring(0, 120)}`,
-                { type: 'risk', confidence: 0.9, source: 'heal_bill' }
-            ));
+        while (Date.now() - started < maxWait) {
+            await new Promise(r => setTimeout(r, pollMs));
+            const { data: job } = await api.get(`/bill-checker/analyze/status/${job_id}`);
+
+            if (job.status === 'done') {
+                const data = job.result;
+                const fin = data?.financial_breakdown;
+                const discrepancyRaw = data?.discrepancy_check;
+                const discrepancy = typeof discrepancyRaw === 'string'
+                    ? discrepancyRaw
+                    : (Array.isArray(discrepancyRaw) ? discrepancyRaw.join('. ') : JSON.stringify(discrepancyRaw ?? ''));
+                const hasDiscrepancy = !!discrepancy && discrepancy !== 'No discrepancies found.';
+
+                bgB(userId, b => b.after(
+                    `Bill: patient owes $${fin?.patient_responsibility}. ${hasDiscrepancy ? 'Discrepancy found.' : 'Clean.'}`,
+                    { source: 'heal_bill' }
+                ));
+                if (hasDiscrepancy) {
+                    bgB(userId, b => b.add(
+                        `Billing discrepancy: ${discrepancy?.substring(0, 120)}`,
+                        { type: 'risk', confidence: 0.9, source: 'heal_bill' }
+                    ));
+                }
+
+                const overcharge = fin?.total_overcharge;
+                const correctOwed = fin?.correct_patient_responsibility;
+
+                let reply;
+                if (hasDiscrepancy) {
+                    const overchargeLabel = overcharge > 0 ? ` — *${fmt$(overcharge)} overcharge detected*` : '';
+                    reply = `🚨 *Billing Errors Found!*${overchargeLabel}\n\n`;
+
+                    // Financial summary
+                    reply += `*Financial Summary*\n`;
+                    reply += `> Total Billed: *${fmt$(fin?.total_charges)}*\n`;
+                    const discount = fin?.amount_saved;
+                    if (discount > 0) {
+                        reply += `> Network Discount: -${fmt$(discount)}\n`;
+                    } else {
+                        reply += `> Network Discount: $0.00 ❌  _not applied_\n`;
+                    }
+                    if (fin?.insurance_payment > 0) {
+                        reply += `> Insurance Payment: -${fmt$(fin.insurance_payment)}\n`;
+                    } else {
+                        reply += `> Insurance Payment: $0.00 ❌  _not credited_\n`;
+                    }
+                    reply += `> Bill Claims You Owe: *${fmt$(fin?.patient_responsibility)}* ❌\n`;
+                    if (correctOwed != null) {
+                        reply += `> Correct Amount Owed: *${fmt$(correctOwed)}* ✅\n`;
+                    }
+                    reply += '\n';
+
+                    // Numbered discrepancies
+                    reply += `*Discrepancies*\n\n`;
+                    reply += formatFindings(discrepancy);
+                    reply += `\n\n*Next Steps:* Call the billing department and request a corrected statement. `;
+                    reply += `Ask them to apply all EOB adjustments and insurance payments. You can dispute in writing if they refuse.`;
+                } else {
+                    reply = `✅ *HEAL Financial Breakdown*\n\n`;
+                    reply += `> Total Billed: *${fmt$(fin?.total_charges)}*\n`;
+                    reply += `> Network Discount: -${fmt$(fin?.amount_saved || 0)}\n`;
+                    reply += `> Insurance Pays: ${fmt$(fin?.insurance_payment)}\n`;
+                    reply += `> *You Owe: ${fmt$(fin?.patient_responsibility)}*\n\n`;
+                    reply += `✅ No discrepancies found — your bill matches your policy.`;
+                }
+                reply += `\n\n_Powered by HEAL AI + Thinkn_`;
+
+                await client.chat.update({ channel, ts, text: reply });
+                return;
+            }
+
+            if (job.status === 'error') {
+                throw new Error(job.error || 'Bill analysis failed. Please try again.');
+            }
+            // still processing — leave current message as-is
         }
 
-        let reply = `✅ *HEAL Financial Breakdown*\n\n`;
-        if (fin) {
-            reply += `*Total Billed:* $${fin.total_charges}\n`;
-            reply += `*Insurance Pays:* $${fin.insurance_payment}\n`;
-            reply += `*You Owe:* $${fin.patient_responsibility}\n\n`;
-        }
-        reply += hasDiscrepancy
-            ? `🚨 *Discrepancy Found:* ${discrepancy}\n`
-            : `✅ No discrepancies found against your policy.\n`;
-        reply += `\n_Powered by HEAL AI + Thinkn_`;
-        return reply;
+        throw new Error('Bill analysis timed out. Please try again.');
     } finally {
         try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     }

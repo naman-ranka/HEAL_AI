@@ -10,7 +10,9 @@
       "Bash(pkill -9 node)",
       "Bash(cmd /c \"taskkill /F /IM node.exe\")",
       "Bash(ngrok version:*)",
-      "Bash(npx ngrok:*)"
+      "Bash(npx ngrok:*)",
+      "Skill(plan-eng-review)",
+      "Skill(plan-eng-review:*)"
     ]
   }
 }

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -266,6 +266,109 @@ async def upload_document(file: UploadFile = File(...)) -> PolicyAnalysisOutput:
             additional_info={"error": str(e)}
         )
         return error_response
+
+
+# ── Async upload endpoints ────────────────────────────────────────────────────
+
+import uuid as _uuid
+
+# In-memory job store: job_id → { status, stage, result, error }
+_upload_jobs: dict = {}
+
+@app.post("/upload/async")
+async def upload_document_async_start(file: UploadFile = File(...)):
+    """
+    Start async upload processing. Returns job_id immediately.
+    Poll GET /upload/status/{job_id} to check progress.
+    """
+    import asyncio as _asyncio
+
+    file_data = await file.read()
+    filename = file.filename or "unknown"
+    content_type = file.content_type or "application/pdf"
+
+    job_id = _uuid.uuid4().hex[:10]
+    _upload_jobs[job_id] = {"status": "processing", "stage": "analyzing", "result": None, "error": None}
+
+    async def _run():
+        try:
+            if not ai_available:
+                # Use a plain dict — PolicyAnalysisOutput may not be defined if AI imports failed
+                mock_result = {
+                    "additional_info": {
+                        "note": "Mock data - configure GEMINI_API_KEY",
+                        "rag_document_id": None,
+                    }
+                }
+                _upload_jobs[job_id] = {"status": "done", "stage": "done", "result": mock_result, "error": None, "_ts": time.time()}
+                return
+
+            encoded_data = base64.b64encode(file_data).decode('utf-8')
+            doc_type = DocumentType.IMAGE if content_type.startswith("image/") else DocumentType.PDF
+            analysis_input = PolicyAnalysisInput(
+                document_data=encoded_data,
+                document_type=doc_type,
+                filename=filename
+            )
+
+            _upload_jobs[job_id]["stage"] = "analyzing"
+            analysis_result = await analyze_insurance_policy(analysis_input)
+            save_to_database(analysis_result.model_dump())
+
+            _upload_jobs[job_id]["stage"] = "indexing"
+            try:
+                rag_result = await document_processor.process_uploaded_file(
+                    file_data=file_data,
+                    filename=filename,
+                    mime_type=content_type
+                )
+                if hasattr(analysis_result, 'additional_info') and analysis_result.additional_info:
+                    analysis_result.additional_info.update({
+                        "rag_document_id": rag_result["document_id"],
+                        "rag_chunks_created": rag_result["chunks_created"]
+                    })
+                else:
+                    analysis_result.additional_info = {
+                        "rag_document_id": rag_result["document_id"],
+                        "rag_chunks_created": rag_result["chunks_created"]
+                    }
+            except Exception as rag_err:
+                logger.error(f"RAG error in async upload job {job_id}: {rag_err}")
+                if not (hasattr(analysis_result, 'additional_info') and analysis_result.additional_info):
+                    analysis_result.additional_info = {}
+                analysis_result.additional_info["rag_error"] = str(rag_err)
+
+            _upload_jobs[job_id] = {
+                "status": "done",
+                "stage": "done",
+                "result": analysis_result.model_dump(),
+                "error": None,
+                "_ts": time.time(),
+            }
+        except Exception as exc:
+            logger.error(f"Async upload job {job_id} failed: {exc}")
+            _upload_jobs[job_id] = {"status": "error", "stage": "error", "result": None, "error": str(exc), "_ts": time.time()}
+
+    _asyncio.create_task(_run())
+    return {"job_id": job_id, "status": "processing"}
+
+
+def _expire_jobs(store: dict, max_age_s: int = 600):
+    """Remove completed/errored jobs older than max_age_s seconds."""
+    now = time.time()
+    stale = [k for k, v in store.items() if v.get("_ts") and now - v["_ts"] > max_age_s]
+    for k in stale:
+        del store[k]
+
+@app.get("/upload/status/{job_id}")
+async def get_upload_job_status(job_id: str):
+    """Poll async upload job status."""
+    _expire_jobs(_upload_jobs)
+    job = _upload_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
 
 
 def validate_analysis_result(analysis_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1234,7 +1337,7 @@ async def analyze_medical_bill(request: dict):
             logger.warning("AI not available, returning structured mock data")
             analysis_result = create_mock_bill_analysis(bill_id)
         else:
-            logger.info(f"🤖 Using REAL AI analysis with Gemini 2.5 Pro for bill {bill_id}")
+            logger.info(f"🤖 Using REAL AI analysis with Gemini 2.5 Flash for bill {bill_id}")
             # Use real AI analysis
             analysis_result = await perform_real_bill_analysis(
                 bill_doc, policy_data, include_dispute_recommendations=True
@@ -1258,6 +1361,78 @@ async def analyze_medical_bill(request: dict):
         logger.exception("Full error traceback:")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
+
+# ── Async bill analysis endpoints ─────────────────────────────────────────────
+
+_bill_jobs: dict = {}
+
+@app.post("/bill-checker/analyze/async")
+async def analyze_bill_async_start(request: Request):
+    """Start async bill analysis. Returns job_id immediately."""
+    import asyncio as _asyncio
+    body = await request.json()
+    bill_id = body.get("bill_id")
+    policy_id = body.get("policy_id")
+    if not bill_id:
+        raise HTTPException(status_code=400, detail="bill_id required")
+
+    job_id = _uuid.uuid4().hex[:10]
+    _bill_jobs[job_id] = {"status": "processing", "result": None, "error": None}
+
+    async def _run():
+        try:
+            conn = sqlite3.connect("heal.db")
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, filename, file_path, extracted_text FROM documents WHERE id = ?",
+                    (bill_id,)
+                )
+                bill_doc = cursor.fetchone()
+                if not bill_doc:
+                    raise ValueError(f"Bill {bill_id} not found")
+
+                if policy_id:
+                    cursor.execute(
+                        "SELECT id, filename, file_path, extracted_text FROM documents WHERE id = ?",
+                        (policy_id,)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, filename, file_path, extracted_text FROM documents WHERE document_type = 'policy' OR document_type IS NULL ORDER BY upload_timestamp DESC LIMIT 1"
+                    )
+                policy_doc = cursor.fetchone()
+                policy_data = {"extracted_text": policy_doc[3]} if policy_doc else None
+            finally:
+                conn.close()
+
+            if not ai_available:
+                result = create_mock_bill_analysis(bill_id)
+            else:
+                result = await perform_real_bill_analysis(bill_doc, policy_data)
+
+            analysis_id = f"analysis_{int(time.time())}_{bill_id}"
+            await store_bill_analysis(analysis_id, bill_id, policy_id, result)
+            result["analysis_id"] = analysis_id
+            _bill_jobs[job_id] = {"status": "done", "result": result, "error": None, "_ts": time.time()}
+        except Exception as exc:
+            logger.error(f"Async bill job {job_id} failed: {exc}")
+            _bill_jobs[job_id] = {"status": "error", "result": None, "error": str(exc), "_ts": time.time()}
+
+    _asyncio.create_task(_run())
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/bill-checker/analyze/status/{job_id}")
+async def get_bill_job_status(job_id: str):
+    """Poll async bill analysis job status."""
+    _expire_jobs(_bill_jobs)
+    job = _bill_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 async def perform_real_bill_analysis(bill_doc, policy_data, include_dispute_recommendations=True):
     """Perform real AI analysis of bill against policy"""
     try:
@@ -1278,8 +1453,7 @@ async def perform_real_bill_analysis(bill_doc, policy_data, include_dispute_reco
                     Copay: {policy_data.get('copay', 'Not specified')}
                     """
         
-        analysis_prompt = f"""
-You are an expert medical billing and insurance analyst. Analyze this medical bill against the patient's insurance policy and provide a detailed breakdown in the exact JSON format specified below.
+        analysis_prompt = f"""You are an expert medical billing auditor. Find every place the patient is being overcharged.
 
 MEDICAL BILL:
 {bill_text}
@@ -1287,91 +1461,80 @@ MEDICAL BILL:
 INSURANCE POLICY:
 {policy_text}
 
-You must respond with a valid JSON object that matches this exact structure:
+AUDIT CHECKLIST — check each item explicitly:
+1. INSURANCE PAYMENTS: Bill shows $0 insurance payments/adjustments? For any in-network patient with active insurance, $0 is almost always fraud or error. Flag it.
+2. NETWORK DISCOUNTS: Does the bill apply negotiated in-network savings? Missing adjustments = patient pays full retail rate = overcharge.
+3. COPAY ACCURACY: What ER/office copay does the policy specify? Does the bill charge exactly that — not more?
+4. PREVENTIVE CARE RULE (ACA mandated): CPT codes 90715 (Tdap vaccine), 90714, 90471, 90472 (immunization administration), and any wellness/preventive visit codes (99381-99397) must be covered at 100% with $0 patient cost. If billed to patient, it is an error regardless of deductible status.
+5. BALANCE MATH: Correct patient_owes = total_billed - network_discount - insurance_payment. If bill skips either subtraction, patient is overcharged.
 
+Return ONLY valid JSON, no other text:
 {{
   "billSummary": {{
-    "patientName": "extracted from bill",
-    "memberId": "extracted from bill if available",
-    "groupName": "extracted from bill if available", 
-    "dateOfService": "YYYY-MM-DD format",
-    "provider": {{
-      "name": "provider name from bill",
-      "status": "In-Network" or "Out-of-Network"
-    }},
+    "patientName": "from bill",
+    "dateOfService": "YYYY-MM-DD",
+    "provider": {{"name": "provider name", "status": "In-Network or Out-of-Network"}},
     "totals": {{
       "providerBilled": 0.00,
+      "networkDiscount": 0.00,
       "planPaid": 0.00,
-      "amountSaved": 0.00,
-      "patientOwed": 0.00
+      "patientOwed": 0.00,
+      "correctPatientOwed": 0.00
     }},
     "serviceDetails": [
-      {{
-        "serviceDescription": "description of service",
-        "serviceCode": "CPT code if available",
-        "providerBilled": 0.00,
-        "amountSaved": 0.00,
-        "planAllowed": 0.00,
-        "planPaid": 0.00,
-        "appliedToDeductible": 0.00,
-        "copay": 0.00,
-        "coinsurance": 0.00,
-        "planDoesNotCover": 0.00,
-        "patientOwed": 0.00,
-        "notes": "explanation of calculation and policy application"
-      }}
+      {{"serviceDescription": "...", "serviceCode": "...", "billedAmount": 0.00, "coveredAt100Pct": false, "patientOwedOnBill": 0.00, "correctPatientOwed": 0.00}}
     ]
   }},
   "coverageAnalysis": {{
-    "summary": "brief summary of coverage",
-    "networkStatus": "explanation of in/out network status",
-    "benefitsApplied": "which benefits from policy were applied",
-    "deductibleStatus": "current deductible status and remaining amount"
+    "summary": "brief summary",
+    "networkStatus": "in/out of network explanation",
+    "benefitsApplied": "which benefits were/weren't applied"
   }},
   "discrepancyCheck": {{
-    "hasDiscrepancies": true/false,
-    "findings": "analysis of actual financial discrepancies where patient pays more than policy requires",
-    "recommendations": "specific actions only if patient is overcharged according to their policy terms"
+    "hasDiscrepancies": true,
+    "totalOvercharge": 0.00,
+    "findings": "itemized list of every error with dollar amounts",
+    "recommendations": "specific steps patient should take to dispute"
   }}
-}}
-
-CRITICAL INSTRUCTIONS:
-1. Extract exact dollar amounts from the bill
-2. Use the policy details to calculate correct coverage
-3. Show detailed line-by-line service breakdown
-4. Calculate deductibles, copays, and coinsurance according to the policy
-5. ONLY flag discrepancies if the patient is paying MORE than they should according to their policy
-6. Out-of-network services are NOT errors if processed correctly per policy rules
-7. Return ONLY the JSON object, no other text
-8. Ensure all dollar amounts are accurate to the cent
-9. Include notes explaining each calculation
-10. Focus on financial accuracy, not administrative details
-"""
+}}"""
 
         # Use existing Genkit AI infrastructure with Gemini 2.5 Pro
         from ai.flows.policy_analysis import analyze_insurance_policy
         from ai.schemas import PolicyAnalysisInput, DocumentType
         
-        # Use Gemini 2.5 Flash for bill analysis
         model = ai_config.get_model('flash')
 
         if not model:
             logger.error("❌ Failed to get Gemini Flash model - falling back to mock")
             return create_mock_bill_analysis("model_unavailable")
 
-        logger.info("🤖 Generating AI bill analysis with Gemini 2.5 Flash...")
+        logger.info("🤖 Generating AI bill analysis with Gemini 1.5 Flash...")
         logger.info(f"📝 Prompt length: {len(analysis_prompt)} characters")
         logger.info(f"📄 Bill text length: {len(bill_text)} characters")
         logger.info(f"📋 Policy text length: {len(policy_text)} characters")
         
-        try:
-            response = model.generate_content(analysis_prompt)
-            analysis_text = response.text
-            logger.info(f"✅ Received AI response: {len(analysis_text)} characters")
-            logger.info(f"🔍 Response preview: {analysis_text[:200]}...")
-        except Exception as api_error:
-            logger.error(f"❌ Gemini API call failed: {api_error}")
-            raise
+        import asyncio as _asyncio
+        analysis_text = None
+        for attempt in range(3):
+            try:
+                # generate_content is synchronous — run in executor to avoid blocking event loop
+                loop = _asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: model.generate_content(
+                        analysis_prompt,
+                        request_options={"timeout": 120}
+                    )
+                )
+                analysis_text = response.text
+                logger.info(f"✅ Received AI response: {len(analysis_text)} characters")
+                break
+            except Exception as api_error:
+                logger.error(f"❌ Gemini API call failed (attempt {attempt+1}/3): {api_error}")
+                if attempt < 2:
+                    await _asyncio.sleep(3)
+                else:
+                    raise
         
         # Parse JSON response directly
         structured_analysis = parse_json_bill_analysis(analysis_text)
@@ -1422,7 +1585,9 @@ def parse_json_bill_analysis(analysis_text: str) -> dict:
                     "total_charges": totals.get("providerBilled", 0.0),
                     "insurance_payment": totals.get("planPaid", 0.0),
                     "patient_responsibility": totals.get("patientOwed", 0.0),
-                    "amount_saved": totals.get("amountSaved", 0.0)
+                    "correct_patient_responsibility": totals.get("correctPatientOwed", totals.get("patientOwed", 0.0)),
+                    "amount_saved": totals.get("networkDiscount", totals.get("amountSaved", 0.0)),
+                    "total_overcharge": discrepancy.get("totalOvercharge", 0.0),
                 },
                 "service_details": bill_summary.get("serviceDetails", []),
                 "dispute_recommendations": [
@@ -1433,7 +1598,7 @@ def parse_json_bill_analysis(analysis_text: str) -> dict:
                         "priority": "high" if discrepancy.get("hasDiscrepancies", False) else "low"
                     }
                 ] if discrepancy.get("findings") else [],
-                "discrepancy_check": discrepancy.get("findings", "No discrepancies found."),
+                "discrepancy_check": (lambda f: f if isinstance(f, str) else (". ".join(f) if isinstance(f, list) else str(f)))(discrepancy.get("findings", "No discrepancies found.")),
                 "confidence_score": 0.95,
                 "full_analysis": ai_analysis,
                 "raw_ai_response": analysis_text
