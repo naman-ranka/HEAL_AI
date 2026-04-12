@@ -1,3 +1,9 @@
 {
-  "U0AT5CJFUMN": 4
+  "U0AT5CJFUMN": 22,
+  "U0AT5CJFUMN_profile": {
+    "insuranceName": "UnitedHealthcare Student Resources",
+    "location": "Phx AZ",
+    "conditions": "None",
+    "collected": true
+  }
 }

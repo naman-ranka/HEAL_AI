@@ -173,11 +173,17 @@ app.message(async ({ message, client }) => {
             await client.chat.postMessage({
                 channel,
                 text:
-                    "👋 *Hi! I'm HEAL — your Silent Medical Billing Advocate.*\n\n" +
-                    "*How to use me:*\n" +
+                    "👋 *Hi! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n" +
+                    "*What I can do:*\n" +
+                    "• 📋 Explain your insurance coverage in plain English\n" +
+                    "• 🏥 Find nearby in-network hospitals, urgent care, specialists\n" +
+                    "• 🧾 Audit medical bills and catch overcharges\n" +
+                    "• 💬 Answer coverage questions (copay, deductible, what's covered)\n\n" +
+                    "*Get started:*\n" +
                     "1. Upload your *insurance policy* PDF — include the word *policy* in your message\n" +
-                    "2. Ask me questions about your coverage, or upload a *medical bill* to check it for errors\n\n" +
-                    "_Your policy is remembered for the session._",
+                    "2. I'll ask for your location to personalise provider lookups _(optional)_\n" +
+                    "3. Ask anything — or upload a medical bill to check it for errors\n\n" +
+                    "⚠️ _I don't provide medical diagnoses or treatment advice — for emergencies, call 911._",
             });
             return;
         }
@@ -246,12 +252,21 @@ async function processPolicyUploadAsync(userId, file, client, channel, ts) {
 
                 state[userId] = docId;
                 delete state[`${userId}_session`];
+
+                // Extract carrier name and store in user profile for contextual chat
+                const carrier = job.result?.policyDetails?.carrier;
+                if (carrier) {
+                    setProfile(userId, { insuranceName: carrier });
+                }
+
                 saveState(state);
 
                 bgB(userId, async b => {
                     const items = [
                         { text: `Active policy_id is ${docId}`, confidence: 0.99, type: 'claim', source: 'slack' },
                     ];
+                    if (carrier)
+                        items.push({ text: `Insurance carrier is ${carrier}`, confidence: 0.95, type: 'evidence', source: 'heal' });
                     const net = job.result?.coverageCosts?.inNetwork;
                     if (net?.deductible?.individual != null)
                         items.push({ text: `In-network deductible is $${net.deductible.individual}`, confidence: 0.95, type: 'evidence', source: 'heal' });
@@ -413,26 +428,139 @@ async function processBillUploadAsync(userId, file, client, channel, ts) {
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
+// ── Profile helpers ───────────────────────────────────────────────────────────
+
+function getProfile(userId) { return state[`${userId}_profile`] || {}; }
+function setProfile(userId, patch) {
+    state[`${userId}_profile`] = { ...getProfile(userId), ...patch };
+    saveState(state);
+}
+
+// Queries that need location context → contextual endpoint
+const LOCATION_INTENT = /hospital|clinic|urgent care|er\b|emergency room|doctor|specialist|physician|provider|dentist|pharmacy|near(by)?|close to|in my area|find a|where (can|do|should)|covered (near|in)/i;
+
+// Queries that are clearly asking for medical advice (hard block)
+const MEDICAL_ADVICE_INTENT = /should i take|diagnos|prescri|my symptom|do i have|is it (serious|cancer|covid|flu)|what (disease|condition)|treat(ment)? for/i;
+
 async function handleChat(userId, text) {
     const policyId = await resolvePolicyId(userId);
     if (!policyId) {
         return '⚠️ *No insurance policy on file.* Upload your policy first — include the word "policy" in your message.';
     }
 
+    const profile = getProfile(userId);
+
+    // ── Profile collection state machine ─────────────────────────────────────
+    const step = state[`${userId}_profileStep`];
+
+    if (step === 'location') {
+        const loc = text.trim();
+        if (/^skip$/i.test(loc)) {
+            setProfile(userId, { locationSkipped: true });
+        } else {
+            setProfile(userId, { location: loc });
+            bgB(userId, b => b.add([
+                { text: `User is located in ${loc}`, confidence: 0.99, type: 'evidence', source: 'user' }
+            ]));
+        }
+        // Move to conditions step
+        state[`${userId}_profileStep`] = 'conditions';
+        saveState(state);
+        return `📍 Got it${profile.locationSkipped ? '' : ` — *${text.trim()}*`}.\n\nOne more (optional): do you have any *pre-existing conditions* I should keep in mind? _(e.g. "diabetes, hypertension" — or type "skip")_`;
+    }
+
+    if (step === 'conditions') {
+        if (!/^skip$/i.test(text.trim())) {
+            const cond = text.trim();
+            setProfile(userId, { conditions: cond });
+            bgB(userId, b => b.add([
+                { text: `Pre-existing conditions: ${cond}`, confidence: 0.9, type: 'evidence', source: 'user' }
+            ]));
+        }
+        delete state[`${userId}_profileStep`];
+        setProfile(userId, { collected: true });
+
+        // Answer the original queued question now
+        const queued = state[`${userId}_queued`];
+        delete state[`${userId}_queued`];
+        saveState(state);
+
+        const confirmMsg = `✅ *Profile saved!* I'll use your details for personalised answers.\n\n`;
+        if (queued) {
+            const answer = await routeChat(userId, queued, policyId);
+            return confirmMsg + answer;
+        }
+        return confirmMsg + `Ask me anything about your coverage or finding nearby providers.`;
+    }
+
+    // ── First interaction — collect profile ───────────────────────────────────
+    if (!profile.collected && !profile.locationSkipped && !state[`${userId}_profileStep`]) {
+        state[`${userId}_profileStep`] = 'location';
+        state[`${userId}_queued`]      = text;
+        saveState(state);
+        return (
+            `👋 Before I answer, a quick question — *what city and state are you in?*\n` +
+            `_(e.g. "Phoenix, AZ" — helps me find nearby in-network providers)_\n\n` +
+            `_Type "skip" if you'd rather not share your location._`
+        );
+    }
+
+    // ── Route to appropriate handler ──────────────────────────────────────────
+    return await routeChat(userId, text, policyId);
+}
+
+async function routeChat(userId, text, policyId) {
+    const profile = getProfile(userId);
+
+    // Hard block: medical advice
+    if (MEDICAL_ADVICE_INTENT.test(text)) {
+        return (
+            `⚠️ *I can't provide medical advice, diagnoses, or treatment recommendations.*\n\n` +
+            `If this is an emergency, call *911* immediately.\n\n` +
+            `I *can* help you find in-network providers nearby, understand your coverage, ` +
+            `or check whether a procedure is covered. What would you like to know?`
+        );
+    }
+
+    // Location / provider lookup → contextual endpoint
+    if (LOCATION_INTENT.test(text) && (profile.location || profile.locationSkipped)) {
+        return await handleContextualChat(userId, text, profile, policyId);
+    }
+
+    // Fallback to contextual if no RAG session possible but we have a profile
+    if (LOCATION_INTENT.test(text)) {
+        return await handleContextualChat(userId, text, profile, policyId);
+    }
+
+    // Standard RAG for policy/coverage questions
+    return await handleRagChat(userId, text);
+}
+
+async function handleContextualChat(userId, text, profile, policyId) {
+    const { data } = await api.post('/chat/contextual', {
+        message:        text,
+        location:       profile.location || '',
+        conditions:     profile.conditions || '',
+        insurance_name: profile.insuranceName || '',
+        policy_id:      policyId,
+    });
+    const rawReply = data.message || data.response || JSON.stringify(data);
+    bgB(userId, b => b.after(rawReply, { source: 'heal_contextual' }));
+    return `🧠 *HEAL:*\n\n${rawReply}`;
+}
+
+async function handleRagChat(userId, text) {
+    const policyId = await resolvePolicyId(userId);
     let sessionId = state[`${userId}_session`];
     if (!sessionId) {
         const { data } = await api.post('/chat/sessions', { document_ids: [policyId] });
         sessionId = data.session_id;
         state[`${userId}_session`] = sessionId;
-        console.log(`[heal] session ${sessionId} for policy ${policyId}`);
+        saveState(state);
     }
-
     const { data } = await api.post(`/chat/sessions/${sessionId}/messages`, { message: text });
     const rawReply = data.message || data.response || JSON.stringify(data);
-
-    // Pass clean text to beliefs (no Slack formatting noise — judges see this graph)
     bgB(userId, b => b.after(rawReply, { source: 'heal_chat' }));
-
     return `🧠 *HEAL:*\n\n${rawReply}`;
 }
 

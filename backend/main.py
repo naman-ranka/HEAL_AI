@@ -682,6 +682,111 @@ async def list_chat_sessions(limit: int = 20) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Contextual chat (profile-aware, location queries, provider lookup) ─────────
+
+_MEDICAL_GUARDRAIL = """
+ABSOLUTE RULES — never break these, no exceptions:
+- Never diagnose medical conditions or interpret symptoms
+- Never recommend, name, or comment on specific medications or dosages
+- Never interpret lab results, imaging, or test values
+- Never advise whether a situation requires emergency care — always say "If this is a medical emergency, call 911 immediately"
+- Never suggest stopping or changing prescribed treatments
+""".strip()
+
+_PROVIDER_FORMAT = """
+When listing hospitals, clinics, or providers:
+- Numbered list, 3–5 options
+- Each entry: Name | Address | Phone (if known)
+- Append a Google Maps link: https://maps.google.com/?q=NAME+ADDRESS (replace spaces with +)
+- Note insurance network status when known (In-Network / Out-of-Network / Unknown)
+""".strip()
+
+@app.post("/chat/contextual")
+async def contextual_chat(request: Request):
+    """
+    Profile-aware chat. Handles location queries (hospital/provider lookup)
+    and general coverage questions enriched with user context.
+    Body: { message, location?, conditions?, insurance_name?, policy_id? }
+    """
+    import asyncio as _asyncio
+    body = await request.json()
+    message      = body.get("message", "").strip()
+    location     = body.get("location", "").strip()
+    conditions   = body.get("conditions", "").strip()
+    insurer      = body.get("insurance_name", "").strip()
+    policy_id    = body.get("policy_id")
+
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+
+    if not ai_available:
+        return {"message": "AI is not configured. Please set GEMINI_API_KEY."}
+
+    # Pull policy text from DB for coverage context
+    policy_text = ""
+    if policy_id:
+        try:
+            conn = sqlite3.connect("heal.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT extracted_text FROM documents WHERE id = ?", (policy_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0]:
+                policy_text = row[0][:2500]
+        except Exception as _e:
+            logger.warning(f"Could not load policy text for contextual chat: {_e}")
+
+    # Build user profile block
+    profile_lines = []
+    if location:     profile_lines.append(f"Location: {location}")
+    if insurer:      profile_lines.append(f"Insurance: {insurer}")
+    if conditions:   profile_lines.append(f"Pre-existing conditions: {conditions}")
+    profile_block = "\n".join(profile_lines) if profile_lines else "Not provided"
+
+    system_prompt = f"""You are HEAL, an expert insurance and healthcare navigation assistant.
+
+USER PROFILE:
+{profile_block}
+
+POLICY EXCERPT:
+{policy_text or "No policy uploaded yet"}
+
+WHAT YOU CAN HELP WITH:
+- Finding in-network hospitals, urgent care centers, specialists, ERs, pharmacies near the user's location
+- Explaining deductibles, copays, coinsurance, out-of-pocket maximums
+- Clarifying what procedures or conditions are covered under the policy
+- Understanding EOBs and medical bills
+- Recommending questions to ask a provider or insurer
+
+{_MEDICAL_GUARDRAIL}
+
+{_PROVIDER_FORMAT}
+
+Be specific, concise, and actionable. When the user's location is known, tailor provider recommendations to that area. When the policy excerpt contains relevant coverage details, quote the specific numbers (dollar amounts, percentages)."""
+
+    full_prompt = f"{system_prompt}\n\nUser: {message}"
+
+    model = ai_config.get_model('flash')
+    if not model:
+        raise HTTPException(status_code=503, detail="AI model unavailable")
+
+    loop = _asyncio.get_event_loop()
+    for attempt in range(3):
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: model.generate_content(full_prompt, request_options={"timeout": 120})
+            )
+            return {"message": response.text}
+        except Exception as exc:
+            logger.error(f"Contextual chat attempt {attempt+1}/3 failed: {exc}")
+            if attempt < 2:
+                await _asyncio.sleep(2)
+            else:
+                raise HTTPException(status_code=500, detail=str(exc))
+
+
+
 @app.post("/summarize")
 async def summarize_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     """
