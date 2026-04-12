@@ -587,12 +587,13 @@ async def send_chat_message(session_id: str, request: Dict[str, Any]) -> Dict[st
         Chatbot response with sources
     """
     try:
-        message = request.get("message", "").strip()
+        message      = request.get("message", "").strip()
+        user_context = request.get("user_context", "").strip()
         if not message:
             raise HTTPException(status_code=400, detail="Message cannot be empty")
-        
-        # Get chatbot response
-        response = await chatbot.chat(message, session_id)
+
+        # Get chatbot response (with optional user profile context)
+        response = await chatbot.chat(message, session_id, user_context=user_context)
         
         return {
             "message": response.message,
@@ -706,7 +707,8 @@ async def contextual_chat(request: Request):
     """
     Profile-aware chat. Handles location queries (hospital/provider lookup)
     and general coverage questions enriched with user context.
-    Body: { message, location?, conditions?, insurance_name?, policy_id? }
+    Body: { message, location?, conditions?, insurance_name?, policy_id?,
+            user_context?, conversation_history? }
     """
     import asyncio as _asyncio
     body = await request.json()
@@ -715,6 +717,8 @@ async def contextual_chat(request: Request):
     conditions   = body.get("conditions", "").strip()
     insurer      = body.get("insurance_name", "").strip()
     policy_id    = body.get("policy_id")
+    user_context = body.get("user_context", "").strip()
+    conv_history = body.get("conversation_history", [])  # list of {role, text}
 
     if not message:
         raise HTTPException(status_code=400, detail="message required")
@@ -722,47 +726,73 @@ async def contextual_chat(request: Request):
     if not ai_available:
         return {"message": "AI is not configured. Please set GEMINI_API_KEY."}
 
-    # Pull policy text from DB for coverage context
-    policy_text = ""
-    if policy_id:
+    # ── Retrieve relevant policy chunks via RAG (much better than raw truncated text)
+    policy_chunks = ""
+    if policy_id and chatbot:
         try:
-            conn = sqlite3.connect("heal.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT extracted_text FROM documents WHERE id = ?", (policy_id,))
-            row = cursor.fetchone()
-            conn.close()
-            if row and row[0]:
-                policy_text = row[0][:2500]
+            result = await chatbot.retriever.retrieve(
+                query=message,
+                top_k=5,
+                similarity_threshold=0.25,
+                document_ids=[int(policy_id)],
+            )
+            if result.chunks:
+                parts = [f"[Policy section {i+1}]: {c.text}" for i, c in enumerate(result.chunks)]
+                policy_chunks = "\n\n".join(parts)
         except Exception as _e:
-            logger.warning(f"Could not load policy text for contextual chat: {_e}")
+            logger.warning(f"RAG retrieval failed for contextual chat: {_e}")
+            # Fallback: grab raw text (wider window now)
+            try:
+                conn = sqlite3.connect("heal.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT extracted_text FROM documents WHERE id = ?", (policy_id,))
+                row = cursor.fetchone()
+                conn.close()
+                if row and row[0]:
+                    policy_chunks = row[0][:8000]
+            except Exception:
+                pass
 
-    # Build user profile block
-    profile_lines = []
-    if location:     profile_lines.append(f"Location: {location}")
-    if insurer:      profile_lines.append(f"Insurance: {insurer}")
-    if conditions:   profile_lines.append(f"Pre-existing conditions: {conditions}")
-    profile_block = "\n".join(profile_lines) if profile_lines else "Not provided"
+    # ── Build user profile block (use rich user_context blob if provided)
+    if user_context:
+        profile_block = user_context
+    else:
+        profile_lines = []
+        if location:    profile_lines.append(f"Location: {location}")
+        if insurer:     profile_lines.append(f"Insurance: {insurer}")
+        if conditions:  profile_lines.append(f"Pre-existing conditions: {conditions}")
+        profile_block = "\n".join(profile_lines) if profile_lines else "Not provided"
+
+    # ── Build conversation history block
+    history_block = ""
+    if conv_history:
+        turns = conv_history[-12:]  # last 6 exchanges
+        history_block = "\nCONVERSATION SO FAR:\n" + "\n".join(
+            f"{'User' if t.get('role') == 'user' else 'HEAL'}: {t.get('text', '')}"
+            for t in turns
+        ) + "\n"
 
     system_prompt = f"""You are HEAL, an expert insurance and healthcare navigation assistant.
+You maintain full conversation context and refer back to earlier messages naturally.
 
 USER PROFILE:
 {profile_block}
 
-POLICY EXCERPT:
-{policy_text or "No policy uploaded yet"}
+RELEVANT POLICY SECTIONS:
+{policy_chunks or "No policy uploaded yet"}
 
 WHAT YOU CAN HELP WITH:
 - Finding in-network hospitals, urgent care centers, specialists, ERs, pharmacies near the user's location
 - Explaining deductibles, copays, coinsurance, out-of-pocket maximums
 - Clarifying what procedures or conditions are covered under the policy
-- Understanding EOBs and medical bills
+- Understanding EOBs, medical bills, and billing discrepancies
 - Recommending questions to ask a provider or insurer
-
+{history_block}
 {_MEDICAL_GUARDRAIL}
 
 {_PROVIDER_FORMAT}
 
-Be specific, concise, and actionable. When the user's location is known, tailor provider recommendations to that area. When the policy excerpt contains relevant coverage details, quote the specific numbers (dollar amounts, percentages)."""
+Be specific, concise, and actionable. Reference prior conversation context when relevant (e.g. "As I mentioned, your ER copay is $200"). When the policy sections contain specific numbers, quote them directly."""
 
     full_prompt = f"{system_prompt}\n\nUser: {message}"
 
@@ -1651,9 +1681,47 @@ Return ONLY valid JSON, no other text:
         # Fallback to mock analysis
         return create_mock_bill_analysis("unknown")
 
+def _normalize_findings(f) -> str:
+    """Robustly flatten whatever shape 'findings' arrives in from the AI.
+
+    Gemini alternates between:
+      - str  : "Missing discount: $4004. Inflated ER copay: $200."
+      - list of str  : ["Missing discount...", "Inflated ER copay..."]
+      - list of dict : [{"issue": "Missing discount", "overcharge": 4004}, ...]
+    """
+    if not f:
+        return "No discrepancies found."
+    if isinstance(f, str):
+        return f
+    if isinstance(f, list):
+        parts = []
+        for item in f:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # Pull the most descriptive text field available
+                text = (
+                    item.get("description") or item.get("issue") or
+                    item.get("finding") or item.get("text") or
+                    item.get("title") or item.get("message") or
+                    item.get("detail") or item.get("name")
+                )
+                if not text:
+                    text = str(item)
+                # Append overcharge amount if present
+                amt = item.get("overcharge") or item.get("amount") or item.get("overchargeAmount")
+                if amt:
+                    text = f"{text} (Overcharge: ${amt})"
+                parts.append(str(text))
+            else:
+                parts.append(str(item))
+        return ". ".join(parts) if parts else "No discrepancies found."
+    return str(f)
+
+
 def parse_json_bill_analysis(analysis_text: str) -> dict:
     """Parse JSON response from AI into frontend-compatible format"""
-    
+
     try:
         # Clean the response text to extract JSON
         import re
@@ -1698,12 +1766,12 @@ def parse_json_bill_analysis(analysis_text: str) -> dict:
                 "dispute_recommendations": [
                     {
                         "issue_type": "Discrepancy Analysis",
-                        "description": discrepancy.get("findings", ""),
+                        "description": _normalize_findings(discrepancy.get("findings", "")),
                         "recommended_action": discrepancy.get("recommendations", ""),
                         "priority": "high" if discrepancy.get("hasDiscrepancies", False) else "low"
                     }
                 ] if discrepancy.get("findings") else [],
-                "discrepancy_check": (lambda f: f if isinstance(f, str) else (". ".join(f) if isinstance(f, list) else str(f)))(discrepancy.get("findings", "No discrepancies found.")),
+                "discrepancy_check": _normalize_findings(discrepancy.get("findings", "No discrepancies found.")),
                 "confidence_score": 0.95,
                 "full_analysis": ai_analysis,
                 "raw_ai_response": analysis_text

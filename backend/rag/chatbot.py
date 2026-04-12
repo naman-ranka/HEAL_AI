@@ -66,19 +66,21 @@ class InsuranceChatbot:
             conn.close()
     
     async def chat(
-        self, 
-        message: str, 
+        self,
+        message: str,
         session_id: str,
-        context_limit: int = 5
+        context_limit: int = 5,
+        user_context: str = "",
     ) -> ChatResponse:
         """
         Process a chat message and return AI response with RAG context
-        
+
         Args:
             message: User's message
             session_id: Chat session ID
             context_limit: Number of relevant chunks to retrieve
-            
+            user_context: Optional pre-built profile string (insurance, conditions, bill history)
+
         Returns:
             ChatResponse with AI-generated answer
         """
@@ -100,21 +102,23 @@ class InsuranceChatbot:
                 document_ids=document_ids
             )
             
-            # Get policy summary for additional context
-            policy_summary = await self._get_policy_summary(document_ids)
-            
+            # Get policy summary only when no rich user_context is available
+            # (user_context blob already contains insurance name, deductibles, copay etc.)
+            policy_summary = "" if user_context else await self._get_policy_summary(document_ids)
+
             # Build enhanced context from retrieved chunks and policy summary
             context = self._build_enhanced_context(retrieval_result.chunks, policy_summary)
             
             # Get conversation history for context
             conversation_history = self.get_chat_history(session_id, limit=10)
             
-            # Generate AI response with conversation context
+            # Generate AI response with conversation context + user profile
             ai_response = await self._generate_ai_response(
-                message, 
-                context, 
+                message,
+                context,
                 retrieval_result.chunks,
-                conversation_history
+                conversation_history,
+                user_context=user_context,
             )
             
             # Calculate confidence based on retrieval quality
@@ -197,16 +201,15 @@ class InsuranceChatbot:
         return "\n\n".join(context_parts)
     
     async def _get_policy_summary(self, document_ids: Optional[List[int]] = None) -> str:
-        """Get policy summary from the most recent policy analysis"""
+        """Get policy summary from the database (scoped to most recent upload)"""
         try:
             conn = get_db_connection()
             try:
                 cursor = conn.cursor()
-                
-                # Get the most recent policy analysis result
+                # policies table has no document_id FK yet; ORDER BY id DESC gives the latest
                 cursor.execute("""
-                    SELECT summary_json FROM policies 
-                    ORDER BY id DESC 
+                    SELECT summary_json FROM policies
+                    ORDER BY id DESC
                     LIMIT 1
                 """)
                 
@@ -244,27 +247,26 @@ class InsuranceChatbot:
             return ""
     
     async def _generate_ai_response(
-        self, 
-        user_message: str, 
+        self,
+        user_message: str,
         context: str,
         chunks: List[RetrievedChunk],
-        conversation_history: List[Dict[str, Any]] = None
+        conversation_history: List[Dict[str, Any]] = None,
+        user_context: str = "",
     ) -> str:
         """Generate AI response using context"""
-        
+
         if not ai_config.is_available():
             return self._generate_fallback_response(user_message, chunks, conversation_history)
-        
+
         try:
-            # Build the prompt with context and conversation history
-            prompt = self._build_conversational_rag_prompt(user_message, context, conversation_history)
-            
-            # Generate response using Gemini
+            prompt = self._build_conversational_rag_prompt(
+                user_message, context, conversation_history, user_context=user_context
+            )
             model = ai_config.get_model('flash')
             response = model.generate_content(prompt)
-            
             return response.text
-            
+
         except Exception as e:
             logger.error(f"Error generating AI response: {e}")
             return self._generate_fallback_response(user_message, chunks, conversation_history)
@@ -308,9 +310,14 @@ USER QUESTION:
 YOUR RESPONSE (use markdown formatting):
 """
 
-    def _build_conversational_rag_prompt(self, user_message: str, context: str, conversation_history: List[Dict[str, Any]] = None) -> str:
-        """Build a conversational RAG prompt with chat history"""
-        
+    def _build_conversational_rag_prompt(self, user_message: str, context: str, conversation_history: List[Dict[str, Any]] = None, user_context: str = "") -> str:
+        """Build a conversational RAG prompt with chat history and user profile context"""
+
+        # Build user context block (insurance name, bill history, conditions, etc.)
+        user_context_block = ""
+        if user_context:
+            user_context_block = f"\nUSER PROFILE (known facts about this user):\n{user_context}\n"
+
         # Build conversation history string
         history_context = ""
         if conversation_history and len(conversation_history) > 0:
@@ -319,8 +326,10 @@ YOUR RESPONSE (use markdown formatting):
                 role = "User" if msg['message_type'] == 'user' else "HEAL"
                 history_context += f"{role}: {msg['content']}\n"
             history_context += "\n"
-        
+
         return f"""You are HEAL, an expert insurance policy assistant. You maintain conversational context and help users understand their insurance policies.
+You have access to the user's profile (insurance, conditions, bill history) and must use it to personalise every answer.
+When the user's insurance name, copay amounts, or bill findings are known, reference them directly instead of giving generic answers.
 
 IMPORTANT FORMATTING RULES:
 - Use markdown formatting with **bold** for headers and - for bullet points
@@ -355,7 +364,7 @@ FORMAT YOUR RESPONSE LIKE THIS EXAMPLE:
 - [Practical implication]
 - [Action you might take]
 
-{history_context}AVAILABLE POLICY INFORMATION:
+{user_context_block}{history_context}AVAILABLE POLICY INFORMATION:
 {context}
 
 CURRENT USER QUESTION:

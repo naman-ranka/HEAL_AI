@@ -12,7 +12,8 @@
       "Bash(ngrok version:*)",
       "Bash(npx ngrok:*)",
       "Skill(plan-eng-review)",
-      "Skill(plan-eng-review:*)"
+      "Skill(plan-eng-review:*)",
+      "Bash(~/.claude/skills/gstack/bin/gstack-learnings-search --limit 10)"
     ]
   }
 }

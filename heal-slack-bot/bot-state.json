@@ -1,9 +1,40 @@
 {
-  "U0AT5CJFUMN": 22,
+  "U0AT5CJFUMN": 34,
   "U0AT5CJFUMN_profile": {
     "insuranceName": "UnitedHealthcare Student Resources",
     "location": "Phx AZ",
     "conditions": "None",
-    "collected": true
-  }
+    "collected": true,
+    "patientName": "Chandan Basavaraj Nooli",
+    "insuranceNumber": "9301081"
+  },
+  "U0AT5CJFUMN_lastBill": {
+    "discrepancies": "Missing Network Discount: The bill fails to apply the negotiated in-network discount of $4,004.00. This directly overcharges the patient by $4,004.00.. Missing Plan Payment: The bill does not reflect the $1,307.30 payment made by United Healthcare, falsely increasing the patient's balance by $1,307.30.. Inflated ER Copay: The Emergency Room copay was billed at $400.00 (CPT 99283-CP) instead of the correct amount of $200.00, resulting in a $200.00 overcharge.. Improper Billing of Preventive Services: CPT code 90715 (Tdap Injection, $465.10) and CPT code 90471 (Immunization Administration, $324.00) are preventive services mandated to be covered at 100% with $0 patient cost under the ACA. These services were incorrectly billed to the patient. This represents an overcharge of $465.10 + $324.00 = $789.10.",
+    "totalOvercharge": 5711.3,
+    "correctOwed": 439.7,
+    "billedAmount": 6151
+  },
+  "U0AT5CJFUMN_ctxHistory": [
+    {
+      "role": "user",
+      "text": "what hospitals near me can I visit with my insurance coverage",
+      "ts": 1775994353238
+    },
+    {
+      "role": "assistant",
+      "text": "Chandan, to find the most accurate and up-to-date list of in-network hospitals near you in Phx, AZ, for your UnitedHealthcare Student Resources plan, you should use the resources provided by your insurer.\n\nAccording to your policy information:\n*   You can \"Search for network providers on **www.uhcsr.com** or the **UHCSR mobile app**.\" Creating an account at www.uhcsr.com/myaccount will give you access to this search tool.\n*   You can also contact UnitedHealthcare Student Resources Customer Service for members at **1-866-652-9185**. They can help you locate in-network providers.\n\nWhen you use their online tool or call customer service, please have your SR ID # (733) and Policy # (9301081) ready, as it will help them provide you with the most relevant information.",
+      "ts": 1775994353250
+    },
+    {
+      "role": "user",
+      "text": "based off my policy, what are the closest hospitals under my insurance I head head to",
+      "ts": 1775995019234
+    },
+    {
+      "role": "assistant",
+      "text": "Chandan, I understand you're looking for specific in-network hospitals closest to you. As I mentioned in our previous conversation, to get the most accurate and up-to-date list tailored to your exact location in Phx, AZ, and your UnitedHealthcare Student Resources plan, you will need to utilize the resources provided by UnitedHealthcare directly.\n\nI cannot generate a real-time list of 3-5 specific hospitals, their addresses, and phone numbers with confirmed in-network status because I don't have access to the dynamic, location-based provider directory that your insurer maintains.\n\nTo find the closest hospitals under your insurance, please follow these steps from your policy:\n\n*   **Search Online:** Go to **www.uhcsr.com** or use the **UHCSR mobile app**. You can create an account at www.uhcsr.com/myaccount to access their search tools.\n*   **Call Customer Service:** Contact UnitedHealthcare Student Resources Customer Service for members at **1-866-652-9185**. They can directly help you locate in-network facilities.\n\nWhen you use these resources, please have your SR ID # (733) and Policy # (9301081) ready. Your policy states: \"With almost every plan, you'll pay less if you choose doctors, clinics and hospitals in your network. Search for network providers on www.uhcsr.com or the UHCSR mobile app.\" Always verify a provider's network status before receiving care to ensure you receive the highest level of coverage.",
+      "ts": 1775995019237
+    }
+  ],
+  "U0AT5CJFUMN_session": "b2a1114a-aa52-47d2-a5e5-7729d11d6bae"
 }

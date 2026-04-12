@@ -1,6 +1,8 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+import { isEmailConfigured, sendDisputeLetter, previewLetter } from './email.js';
+
 import pkg from '@slack/bolt';
 const { App, LogLevel } = pkg;
 import axios from 'axios';
@@ -86,6 +88,32 @@ async function searchB(userId, query) {
 
 // ── State helpers ─────────────────────────────────────────────────────────────
 
+/** Build a compact user context string to inject into every AI prompt */
+function buildUserContext(profile, lastBill) {
+    const lines = [];
+    if (profile.patientName)     lines.push(`Patient: ${profile.patientName}`);
+    if (profile.insuranceName)   lines.push(`Insurance: ${profile.insuranceName}`);
+    if (profile.insuranceNumber) lines.push(`Insurance #: ${profile.insuranceNumber}`);
+    if (profile.location)        lines.push(`Location: ${profile.location}`);
+    if (profile.conditions)      lines.push(`Pre-existing conditions: ${profile.conditions}`);
+    if (profile.university)      lines.push(`University: ${profile.university}`);
+    if (lastBill?.discrepancies) {
+        lines.push(`Last bill analysis: ${String(lastBill.discrepancies).slice(0, 300)}`);
+        if (lastBill.totalOvercharge > 0) lines.push(`Bill overcharge found: $${lastBill.totalOvercharge}`);
+        if (lastBill.correctOwed  != null) lines.push(`Correct amount owed: $${lastBill.correctOwed}`);
+    }
+    return lines.join('\n');
+}
+
+/** Contextual chat history (location queries) — last 12 turns per user, persisted */
+function getContextualHistory(userId) { return state[`${userId}_ctxHistory`] || []; }
+function appendContextualHistory(userId, role, text) {
+    const hist = getContextualHistory(userId);
+    hist.push({ role, text, ts: Date.now() });
+    state[`${userId}_ctxHistory`] = hist.slice(-12); // keep last 6 exchanges
+    saveState(state);
+}
+
 async function resolvePolicyId(userId) {
     if (state[userId]) return state[userId];
     const results = await searchB(userId, 'active policy_id');
@@ -147,19 +175,89 @@ app.message(async ({ message, client }) => {
 
         // ── File upload ───────────────────────────────────────────────────────
         if (message.files?.length) {
-            const isPolicy = /policy|insurance/i.test(lc);
+            const file     = message.files[0];
+            const filename = (file.name || '').toLowerCase();
+
+            // ── Classify the uploaded file (bill vs policy) ───────────────────
+            //
+            // Key insight: "based off my policy, check this bill" — "policy" is CONTEXT,
+            // not a description of the uploaded file. We need to detect what the FILE is,
+            // not what the message mentions in passing.
+            //
+            // Priority:
+            //  1. Filename — strongest, most reliable signal
+            //  2. Message explicitly refers to the file as a bill or policy
+            //  3. Ambiguous → ask rather than guess wrong
+
+            const BILL_FILENAME    = /bill|invoice|statement|claim|receipt|charges/i;
+            const POLICY_FILENAME  = /policy|insurance|coverage|eob|explanation.of.benefit/i;
+
+            // "The file IS a bill" — user refers to the uploaded file as a bill
+            const BILL_SUBJECT = /\b(this|the|my|a)\s+(medical\s+)?(bill|invoice|statement|receipt)\b|check\s+(this|the|it)\s*(for\s*(errors?|issues?|problems?))?|is\s+there\s+(any\s+)?(issue|error|problem)\s+in\s+this|any\s+(issue|error|discrepancy)/i;
+
+            // "The file IS a policy" — user is explicitly uploading a policy document.
+            // Matches: bare "policy"/"insurance" keyword, explicit upload phrases.
+            // Deliberately does NOT override BILL_SUBJECT — checked only when no bill signals.
+            const POLICY_SUBJECT = /\b(policy|insurance|coverage|health\s+card|id\s+card|member\s+card|eob|explanation\s+of\s+benefits?)\b/i;
+
+            const isBillFile   = BILL_FILENAME.test(filename);
+            const isPolicyFile = POLICY_FILENAME.test(filename);
+            const isBillMsg    = BILL_SUBJECT.test(lc);
+            const isPolicyMsg  = POLICY_SUBJECT.test(lc);
+
+            const isBill   = isBillFile   || (!isPolicyFile && isBillMsg);
+            const isPolicy = isPolicyFile || (!isBillFile  && !isBillMsg && isPolicyMsg);
+
+            console.log(`[file-classify] filename="${filename}" isBill=${isBill}(file:${isBillFile},msg:${isBillMsg}) isPolicy=${isPolicy}(file:${isPolicyFile},msg:${isPolicyMsg})`);
+
             if (isPolicy) {
-                // Fire-and-forget: post placeholder immediately, update as stages complete
                 const msg = await client.chat.postMessage({ channel, text: '📤 _Uploading your policy..._' });
-                processPolicyUploadAsync(userId, message.files[0], client, channel, msg.ts)
+                processPolicyUploadAsync(userId, file, client, channel, msg.ts)
+                    .catch(async err => {
+                        console.error('[policy-upload]', err.message);
+                        try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
+                    });
+            } else if (isBill) {
+                const msg = await client.chat.postMessage({ channel, text: '📤 _Uploading your bill..._' });
+                processBillUploadAsync(userId, file, client, channel, msg.ts)
+                    .catch(async err => {
+                        console.error('[bill-upload]', err.message);
+                        try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
+                    });
+            } else {
+                // Genuinely ambiguous — remember the file, ask once
+                state[`${userId}_pendingFile`] = {
+                    name:                file.name,
+                    url_private_download: file.url_private_download,
+                    mimetype:            file.mimetype,
+                };
+                saveState(state);
+                await client.chat.postMessage({
+                    channel,
+                    text:
+                        `📎 Got *${file.name}*. Is this:\n\n` +
+                        `• An *insurance policy* → reply \`policy\`\n` +
+                        `• A *medical bill* → reply \`bill\``,
+                });
+            }
+            return;
+        }
+
+        // ── Pending file resolution (user replied "policy" or "bill") ─────────
+        if (state[`${userId}_pendingFile`] && /^(policy|bill)$/i.test(text.trim())) {
+            const pf = state[`${userId}_pendingFile`];
+            delete state[`${userId}_pendingFile`];
+            saveState(state);
+            if (/^policy$/i.test(text.trim())) {
+                const msg = await client.chat.postMessage({ channel, text: '📤 _Processing your policy..._' });
+                processPolicyUploadAsync(userId, pf, client, channel, msg.ts)
                     .catch(async err => {
                         console.error('[policy-upload]', err.message);
                         try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
                     });
             } else {
-                // Fire-and-forget: post placeholder immediately, poll backend for result
-                const msg = await client.chat.postMessage({ channel, text: '📤 _Uploading your bill..._' });
-                processBillUploadAsync(userId, message.files[0], client, channel, msg.ts)
+                const msg = await client.chat.postMessage({ channel, text: '💸 _Checking your bill..._' });
+                processBillUploadAsync(userId, pf, client, channel, msg.ts)
                     .catch(async err => {
                         console.error('[bill-upload]', err.message);
                         try { await client.chat.update({ channel, ts: msg.ts, text: `❌ *Error:* ${err.message}` }); } catch {}
@@ -176,13 +274,17 @@ app.message(async ({ message, client }) => {
                     "👋 *Hi! I'm HEAL — your AI Healthcare Financial Advocate.*\n\n" +
                     "*What I can do:*\n" +
                     "• 📋 Explain your insurance coverage in plain English\n" +
-                    "• 🏥 Find nearby in-network hospitals, urgent care, specialists\n" +
+                    "• 🏥 Find nearby in-network hospitals, urgent care & specialists\n" +
                     "• 🧾 Audit medical bills and catch overcharges\n" +
-                    "• 💬 Answer coverage questions (copay, deductible, what's covered)\n\n" +
+                    "• 💬 Answer coverage questions (copay, deductible, what's covered)\n" +
+                    "• 📅 Book a campus health center appointment with a calendar invite\n" +
+                    "• 📧 Send a formal billing dispute letter straight from Slack\n\n" +
                     "*Get started:*\n" +
                     "1. Upload your *insurance policy* PDF — include the word *policy* in your message\n" +
-                    "2. I'll ask for your location to personalise provider lookups _(optional)_\n" +
-                    "3. Ask anything — or upload a medical bill to check it for errors\n\n" +
+                    "2. I'll ask a few quick questions to personalise your experience _(all optional)_\n" +
+                    "3. Ask anything — or upload a medical bill to check for errors\n" +
+                    "4. Type *\"book appointment\"* to schedule a campus clinic visit\n" +
+                    "5. Type *\"email dispute\"* to send a billing dispute letter\n\n" +
                     "⚠️ _I don't provide medical diagnoses or treatment advice — for emergencies, call 911._",
             });
             return;
@@ -253,11 +355,15 @@ async function processPolicyUploadAsync(userId, file, client, channel, ts) {
                 state[userId] = docId;
                 delete state[`${userId}_session`];
 
-                // Extract carrier name and store in user profile for contextual chat
-                const carrier = job.result?.policyDetails?.carrier;
-                if (carrier) {
-                    setProfile(userId, { insuranceName: carrier });
-                }
+                // Extract policy details and store in user profile for contextual chat + appointments
+                const carrier      = job.result?.policyDetails?.carrier;
+                const policyHolder = job.result?.policyDetails?.policyHolder;
+                const policyNumber = job.result?.policyDetails?.policyNumber;
+                const profilePatch = {};
+                if (carrier)      profilePatch.insuranceName    = carrier;
+                if (policyHolder) profilePatch.patientName      = policyHolder;
+                if (policyNumber) profilePatch.insuranceNumber  = policyNumber;
+                if (Object.keys(profilePatch).length) setProfile(userId, profilePatch);
 
                 saveState(state);
 
@@ -279,14 +385,29 @@ async function processPolicyUploadAsync(userId, file, client, channel, ts) {
                     await b.add(items);
                 });
 
-                await client.chat.update({
-                    channel, ts,
-                    text:
-                        `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
-                        `You can now:\n` +
-                        `• Ask me questions about your coverage\n` +
-                        `• Upload a medical bill to check it for errors`,
-                });
+                // Kick off upfront profile collection if not yet done
+                if (!getProfile(userId).collected) {
+                    state[`${userId}_profileStep`] = 'location';
+                    saveState(state);
+                    await client.chat.update({
+                        channel, ts,
+                        text:
+                            `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
+                            `Let's personalise your experience — a few quick questions.\n\n` +
+                            `📍 *What city and state are you in?*\n` +
+                            `_(e.g. "Phoenix, AZ" — helps me find nearby in-network providers)_\n\n` +
+                            `_Type "skip" if you'd rather not share your location._`,
+                    });
+                } else {
+                    await client.chat.update({
+                        channel, ts,
+                        text:
+                            `✅ *Policy saved!* _(ID: \`${docId}\`)_\n\n` +
+                            `You can now:\n` +
+                            `• Ask me questions about your coverage\n` +
+                            `• Upload a medical bill to check it for errors`,
+                    });
+                }
                 return;
             }
 
@@ -355,6 +476,17 @@ async function processBillUploadAsync(userId, file, client, channel, ts) {
                     ? discrepancyRaw
                     : (Array.isArray(discrepancyRaw) ? discrepancyRaw.join('. ') : JSON.stringify(discrepancyRaw ?? ''));
                 const hasDiscrepancy = !!discrepancy && discrepancy !== 'No discrepancies found.';
+
+                // Store bill result for reimbursement email flow
+                if (hasDiscrepancy) {
+                    state[`${userId}_lastBill`] = {
+                        discrepancies:   discrepancy,
+                        totalOvercharge: fin?.total_overcharge  || 0,
+                        correctOwed:     fin?.correct_patient_responsibility,
+                        billedAmount:    fin?.patient_responsibility,
+                    };
+                    saveState(state);
+                }
 
                 bgB(userId, b => b.after(
                     `Bill: patient owes $${fin?.patient_responsibility}. ${hasDiscrepancy ? 'Discrepancy found.' : 'Clean.'}`,
@@ -436,11 +568,54 @@ function setProfile(userId, patch) {
     saveState(state);
 }
 
-// Queries that need location context → contextual endpoint
+// Queries that want a REAL-WORLD provider location (triggers OSM search)
+// Distinct from policy questions that merely *mention* hospitals/doctors
+const SEARCH_INTENT = /near(by| me| my|est)|\bfind (a|me|the|an?)\b|\bshow me\b|\bwhere (can i|should i|do i) (go|visit|find|see)\b|in my area|close to me|covered.*(near|in|around)|(hospital|clinic|provider|doctor|dentist|pharmacy|urgent care).*(near|around|close|visit|covered)/i;
+
+// Queries that need location context → contextual endpoint (coverage questions that mention location)
 const LOCATION_INTENT = /hospital|clinic|urgent care|er\b|emergency room|doctor|specialist|physician|provider|dentist|pharmacy|near(by)?|close to|in my area|find a|where (can|do|should)|covered (near|in)/i;
 
 // Queries that are clearly asking for medical advice (hard block)
 const MEDICAL_ADVICE_INTENT = /should i take|diagnos|prescri|my symptom|do i have|is it (serious|cancer|covid|flu)|what (disease|condition)|treat(ment)? for/i;
+
+// Appointment booking intent
+const APPOINTMENT_INTENT = /book|schedule|appointment|appt|campus (health|clinic)|health center|make an? (appointment|booking)/i;
+
+// Reimbursement email intent
+const EMAIL_INTENT = /email|dispute (letter|email)|reimburs|send.*bill|billing (dispute|complaint)|send.*email/i;
+// Retry keywords that should re-enter an in-progress email confirm step
+const EMAIL_RETRY = /^(send|try again|retry|yes)$/i;
+
+/** Build a Google Calendar quick-add URL pre-filled with appointment details */
+function makeCalendarLink({ name, university, phone, datetime, reason, insuranceName, insuranceNumber, conditions }) {
+    const uniHealth = university ? `${university} Health Center` : 'Campus Health Center';
+
+    const params = new URLSearchParams({
+        action: 'TEMPLATE',
+        text: `Medical Appointment — ${uniHealth}`,
+        details: [
+            `Patient: ${name || 'N/A'}`,
+            `Phone: ${phone || 'N/A'}`,
+            `Insurance: ${insuranceName || 'N/A'}`,
+            `Insurance #: ${insuranceNumber || 'N/A'}`,
+            `Pre-existing conditions: ${conditions || 'None'}`,
+            `Reason: ${reason || 'N/A'}`,
+        ].join('\n'),
+        location: uniHealth,
+    });
+
+    // Try to parse the datetime string for calendar dates (YYYYMMDDTHHMMSSZ/...)
+    if (datetime) {
+        const parsed = new Date(datetime);
+        if (!isNaN(parsed.getTime())) {
+            const fmt = d => d.toISOString().replace(/[-:.]/g, '').slice(0, 15) + 'Z';
+            const end = new Date(parsed.getTime() + 60 * 60 * 1000); // 1-hour slot
+            params.set('dates', `${fmt(parsed)}/${fmt(end)}`);
+        }
+    }
+
+    return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
 
 async function handleChat(userId, text) {
     const policyId = await resolvePolicyId(userId);
@@ -449,6 +624,16 @@ async function handleChat(userId, text) {
     }
 
     const profile = getProfile(userId);
+
+    // ── In-progress flow interceptors (appointment / email) ───────────────────
+    if (state[`${userId}_aptStep`])   return await handleAppointmentStep(userId, text);
+    if (state[`${userId}_emailStep`]) return await handleEmailStep(userId, text);
+    // Retry shorthand when no active step but draft is still saved
+    if (state[`${userId}_emailDraft`] && EMAIL_RETRY.test(text.trim())) {
+        state[`${userId}_emailStep`] = 'confirm';
+        saveState(state);
+        return await handleEmailStep(userId, text);
+    }
 
     // ── Profile collection state machine ─────────────────────────────────────
     const step = state[`${userId}_profileStep`];
@@ -477,20 +662,34 @@ async function handleChat(userId, text) {
                 { text: `Pre-existing conditions: ${cond}`, confidence: 0.9, type: 'evidence', source: 'user' }
             ]));
         }
+        // Move to university step
+        state[`${userId}_profileStep`] = 'university';
+        saveState(state);
+        return `🎓 Are you a student? *What university do you attend?*\n_(e.g. "Arizona State University" — helps me find your campus health center)_\n\n_Type "skip" if not applicable._`;
+    }
+
+    if (step === 'university') {
+        if (!/^skip$/i.test(text.trim())) {
+            const uni = text.trim();
+            setProfile(userId, { university: uni });
+            bgB(userId, b => b.add([
+                { text: `Student at ${uni}`, confidence: 0.95, type: 'evidence', source: 'user' }
+            ]));
+        }
         delete state[`${userId}_profileStep`];
         setProfile(userId, { collected: true });
 
-        // Answer the original queued question now
         const queued = state[`${userId}_queued`];
         delete state[`${userId}_queued`];
         saveState(state);
 
-        const confirmMsg = `✅ *Profile saved!* I'll use your details for personalised answers.\n\n`;
+        const uni = getProfile(userId).university;
+        const confirmMsg = `✅ *Profile saved!*${uni ? ` I know your campus health center at *${uni}*.` : ''} Ask me anything — coverage questions, nearby providers, or type *"book appointment"* to schedule a campus clinic visit.\n\n`;
         if (queued) {
             const answer = await routeChat(userId, queued, policyId);
             return confirmMsg + answer;
         }
-        return confirmMsg + `Ask me anything about your coverage or finding nearby providers.`;
+        return confirmMsg;
     }
 
     // ── First interaction — collect profile ───────────────────────────────────
@@ -509,8 +708,234 @@ async function handleChat(userId, text) {
     return await routeChat(userId, text, policyId);
 }
 
+// ── Appointment booking ───────────────────────────────────────────────────────
+
+async function startAppointment(userId) {
+    const profile = getProfile(userId);
+    const uni     = profile.university;
+    const uniHealth = uni ? `${uni} Health Center` : 'your campus health center';
+
+    // Seed accumulator with whatever we already know from the policy
+    state[`${userId}_apt`] = {
+        name:           profile.patientName    || null,
+        insuranceName:  profile.insuranceName  || null,
+        insuranceNumber: profile.insuranceNumber || null,
+        conditions:     profile.conditions     || null,
+        university:     uni                    || null,
+    };
+
+    if (!profile.patientName) {
+        state[`${userId}_aptStep`] = 'name';
+        saveState(state);
+        return (
+            `📅 *Book a Campus Appointment*\n\n` +
+            `Let's get you set up at ${uniHealth}.\n\n` +
+            `What is your *full name*?`
+        );
+    }
+
+    state[`${userId}_aptStep`] = 'phone';
+    saveState(state);
+    return (
+        `📅 *Book a Campus Appointment*\n\n` +
+        `Setting up your visit at ${uniHealth}.\n\n` +
+        `*Name:* ${profile.patientName} ✓\n` +
+        `*Insurance:* ${profile.insuranceName || 'from your policy'} ✓\n\n` +
+        `What is your *phone number*?`
+    );
+}
+
+async function handleAppointmentStep(userId, text) {
+    const aptStep = state[`${userId}_aptStep`];
+    const apt     = state[`${userId}_apt`] || {};
+    const profile = getProfile(userId);
+
+    if (aptStep === 'name') {
+        apt.name = text.trim();
+        state[`${userId}_apt`]   = apt;
+        state[`${userId}_aptStep`] = 'phone';
+        saveState(state);
+        return `👤 *Name:* ${apt.name} ✓\n\nWhat is your *phone number*?`;
+    }
+
+    if (aptStep === 'phone') {
+        apt.phone = text.trim();
+        state[`${userId}_apt`]   = apt;
+        state[`${userId}_aptStep`] = 'datetime';
+        saveState(state);
+        return (
+            `📱 *Phone:* ${apt.phone} ✓\n\n` +
+            `What is your *preferred date and time?*\n` +
+            `_(e.g. "Monday at 2pm", "April 15 at 10am")_`
+        );
+    }
+
+    if (aptStep === 'datetime') {
+        apt.datetime = text.trim();
+        state[`${userId}_apt`]   = apt;
+        state[`${userId}_aptStep`] = 'reason';
+        saveState(state);
+        return (
+            `🗓️ *Date/Time:* ${apt.datetime} ✓\n\n` +
+            `What is the *reason for your visit?*\n` +
+            `_(e.g. "annual checkup", "sore throat", "prescription refill")_`
+        );
+    }
+
+    if (aptStep === 'reason') {
+        apt.reason = text.trim();
+        // Clear booking state
+        delete state[`${userId}_aptStep`];
+        delete state[`${userId}_apt`];
+        saveState(state);
+
+        const calLink   = makeCalendarLink({ ...apt, ...profile });
+        const uni       = apt.university || profile.university;
+        const uniHealth = uni ? `${uni} Health Center` : 'Campus Health Center';
+
+        return (
+            `📅 *Appointment Request Ready!*\n\n` +
+            `*Location:* ${uniHealth}\n` +
+            `*Patient:* ${apt.name}\n` +
+            `*Phone:* ${apt.phone}\n` +
+            `*Insurance:* ${apt.insuranceName || 'On file'} (${apt.insuranceNumber || 'see policy'})\n` +
+            `*Conditions:* ${apt.conditions || profile.conditions || 'None reported'}\n` +
+            `*Date/Time:* ${apt.datetime}\n` +
+            `*Reason:* ${apt.reason}\n\n` +
+            `👉 <${calLink}|*Add to Google Calendar*>\n\n` +
+            `_Click the link to save this to your calendar. Contact ${uniHealth} directly to confirm your booking._`
+        );
+    }
+
+    // Unknown step — reset gracefully
+    delete state[`${userId}_aptStep`];
+    delete state[`${userId}_apt`];
+    saveState(state);
+    return '⚠️ Something went wrong. Type *"book appointment"* to start again.';
+}
+
+// ── Reimbursement email ───────────────────────────────────────────────────────
+
+async function startEmail(userId) {
+    if (!isEmailConfigured()) {
+        return (
+            `⚠️ *Email not configured.* Add \`GMAIL_USER\` and \`GMAIL_APP_PASSWORD\` to \`.env\` to enable this feature.\n\n` +
+            `Setup (2 min):\n` +
+            `1. Enable 2FA: myaccount.google.com → Security → 2-Step Verification\n` +
+            `2. Create App Password: myaccount.google.com → Security → App passwords → "HEAL"\n` +
+            `3. Paste the 16-char password as \`GMAIL_APP_PASSWORD\` in \`heal-slack-bot/.env\``
+        );
+    }
+
+    const bill = state[`${userId}_lastBill`];
+    if (!bill?.discrepancies) {
+        return (
+            `⚠️ *No bill discrepancies on file.* Upload a medical bill first — ` +
+            `I'll find any errors, then you can send a dispute letter directly from here.`
+        );
+    }
+
+    state[`${userId}_emailStep`] = 'to';
+    saveState(state);
+    return (
+        `📧 *Send Billing Dispute Letter*\n\n` +
+        `I'll draft a formal dispute letter based on your last bill analysis.\n\n` +
+        `What is the *billing department's email address?*\n` +
+        `_(Or type \`me\` to send it to yourself for review)_`
+    );
+}
+
+async function handleEmailStep(userId, text) {
+    const emailStep = state[`${userId}_emailStep`];
+    const profile   = getProfile(userId);
+    const bill      = state[`${userId}_lastBill`] || {};
+
+    if (emailStep === 'to') {
+        const rawTo = text.trim();
+        const to = rawTo.toLowerCase() === 'me' ? process.env.GMAIL_USER : rawTo;
+
+        const draft = {
+            to,
+            patientName:     profile.patientName    || 'Patient',
+            insuranceName:   profile.insuranceName  || 'Insurance',
+            insuranceNumber: profile.insuranceNumber || 'N/A',
+            discrepancies:   bill.discrepancies     || 'See attached bill.',
+            totalOvercharge: bill.totalOvercharge   || 0,
+            correctOwed:     bill.correctOwed,
+            billedAmount:    bill.billedAmount,
+        };
+
+        state[`${userId}_emailDraft`] = draft;
+        state[`${userId}_emailStep`]  = 'confirm';
+        saveState(state);
+
+        return previewLetter(draft);
+    }
+
+    if (emailStep === 'confirm') {
+        const trimmed   = text.trim().toLowerCase();
+        const cancelled = trimmed === 'cancel';
+        const confirmed = /^(send|try again|retry|yes)/.test(trimmed);
+
+        if (cancelled) {
+            delete state[`${userId}_emailStep`];
+            delete state[`${userId}_emailDraft`];
+            saveState(state);
+            return '🚫 *Dispute email cancelled.* Type *"email dispute"* any time to try again.';
+        }
+
+        if (!confirmed) {
+            return 'Please reply *send* to send the email, or *cancel* to abort.';
+        }
+
+        // Keep state alive until we know the send succeeded
+        const draft = state[`${userId}_emailDraft`] || {};
+        try {
+            const { subject, to } = await sendDisputeLetter(draft);
+            // Only clear state on success
+            delete state[`${userId}_emailStep`];
+            delete state[`${userId}_emailDraft`];
+            saveState(state);
+            bgB(userId, b => b.add(
+                `Billing dispute email sent to ${to}`,
+                { type: 'action', confidence: 1.0, source: 'heal_email' }
+            ));
+            return (
+                `✅ *Dispute letter sent!*\n\n` +
+                `*To:* ${to}\n` +
+                `*Subject:* ${subject}\n\n` +
+                `_Keep a copy for your records. If the billing department doesn't respond within 30 days, ` +
+                `you can escalate to your state insurance commissioner._`
+            );
+        } catch (err) {
+            console.error('[email]', err.message);
+            // Leave state intact so user can fix .env and type "send" again
+            return (
+                `❌ *Failed to send:* ${err.message}\n\n` +
+                `Fix your \`GMAIL_APP_PASSWORD\` in \`.env\`, restart the bot, then type *send* to retry — your draft is still saved.`
+            );
+        }
+    }
+
+    // Unknown step — reset
+    delete state[`${userId}_emailStep`];
+    delete state[`${userId}_emailDraft`];
+    saveState(state);
+    return '⚠️ Something went wrong. Type *"email dispute"* to start again.';
+}
+
 async function routeChat(userId, text, policyId) {
     const profile = getProfile(userId);
+
+    // Appointment booking
+    if (APPOINTMENT_INTENT.test(text)) {
+        return await startAppointment(userId);
+    }
+
+    // Reimbursement email
+    if (EMAIL_INTENT.test(text)) {
+        return await startEmail(userId);
+    }
 
     // Hard block: medical advice
     if (MEDICAL_ADVICE_INTENT.test(text)) {
@@ -522,12 +947,23 @@ async function routeChat(userId, text, policyId) {
         );
     }
 
-    // Location / provider lookup → contextual endpoint
-    if (LOCATION_INTENT.test(text) && (profile.location || profile.locationSkipped)) {
-        return await handleContextualChat(userId, text, profile, policyId);
+    // Real-world provider search → OpenStreetMap (not Gemini hallucination)
+    if (SEARCH_INTENT.test(text)) {
+        if (!profile.location) {
+            // Queue the question, collect location first
+            state[`${userId}_profileStep`] = 'location';
+            state[`${userId}_queued`]      = text;
+            saveState(state);
+            return (
+                `📍 To find nearby providers I need your location.\n\n` +
+                `*What city and state are you in?*\n` +
+                `_(e.g. "Phoenix, AZ" — or type "skip" for a Google Maps link)_`
+            );
+        }
+        return await handleProviderSearch(userId, text, profile);
     }
 
-    // Fallback to contextual if no RAG session possible but we have a profile
+    // Location / coverage context → RAG + location endpoint
     if (LOCATION_INTENT.test(text)) {
         return await handleContextualChat(userId, text, profile, policyId);
     }
@@ -537,29 +973,177 @@ async function routeChat(userId, text, policyId) {
 }
 
 async function handleContextualChat(userId, text, profile, policyId) {
+    const lastBill = state[`${userId}_lastBill`] || {};
+    const history  = getContextualHistory(userId);
+
     const { data } = await api.post('/chat/contextual', {
-        message:        text,
-        location:       profile.location || '',
-        conditions:     profile.conditions || '',
-        insurance_name: profile.insuranceName || '',
-        policy_id:      policyId,
+        message:              text,
+        location:             profile.location       || '',
+        conditions:           profile.conditions     || '',
+        insurance_name:       profile.insuranceName  || '',
+        policy_id:            policyId,
+        user_context:         buildUserContext(profile, lastBill),
+        conversation_history: history,
     });
+
     const rawReply = data.message || data.response || JSON.stringify(data);
+
+    // Persist this exchange to the contextual history buffer
+    appendContextualHistory(userId, 'user',      text);
+    appendContextualHistory(userId, 'assistant', rawReply);
+
     bgB(userId, b => b.after(rawReply, { source: 'heal_contextual' }));
     return `🧠 *HEAL:*\n\n${rawReply}`;
 }
 
-async function handleRagChat(userId, text) {
-    const policyId = await resolvePolicyId(userId);
-    let sessionId = state[`${userId}_session`];
-    if (!sessionId) {
-        const { data } = await api.post('/chat/sessions', { document_ids: [policyId] });
-        sessionId = data.session_id;
-        state[`${userId}_session`] = sessionId;
-        saveState(state);
+// ── Hospital / provider search (OpenStreetMap — free, no API key) ─────────────
+
+// Cache geocoded coordinates per location string to respect Nominatim 1 req/sec
+const geocodeCache = {};
+
+async function geocodeLocation(locationStr) {
+    if (geocodeCache[locationStr]) return geocodeCache[locationStr];
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(locationStr)}&format=json&limit=1`;
+    const { data } = await axios.get(url, {
+        headers: { 'User-Agent': 'HEAL-AI-HealthcareBot/1.0 (hackathon project)' },
+        timeout: 10_000,
+    });
+    if (!data?.length) return null;
+    const result = { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+    geocodeCache[locationStr] = result;
+    return result;
+}
+
+async function searchNearbyHospitals(locationStr, radiusMeters = 15000, amenityType = null) {
+    const coords = await geocodeLocation(locationStr);
+    if (!coords) return [];
+
+    const amenityFilter = amenityType
+        ? `["amenity"="${amenityType}"]`
+        : `["amenity"~"hospital|clinic|urgent_care"]`;
+
+    const query =
+        `[out:json][timeout:20];\n` +
+        `(\n` +
+        `  node${amenityFilter}(around:${radiusMeters},${coords.lat},${coords.lng});\n` +
+        `  way${amenityFilter}(around:${radiusMeters},${coords.lat},${coords.lng});\n` +
+        `);\n` +
+        `out center 8;`;
+
+    const { data } = await axios.post(
+        'https://overpass-api.de/api/interpreter',
+        `data=${encodeURIComponent(query)}`,
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 25_000 }
+    );
+
+    return (data.elements || [])
+        .filter(el => el.tags?.name)
+        .map(el => {
+            const lat = el.lat ?? el.center?.lat;
+            const lng = el.lon ?? el.center?.lon;
+            const addr = [
+                el.tags['addr:housenumber'],
+                el.tags['addr:street'],
+                el.tags['addr:city'] || locationStr,
+            ].filter(Boolean).join(' ');
+            return { name: el.tags.name, addr, lat, lng, type: el.tags.amenity };
+        })
+        .slice(0, 5);
+}
+
+function formatHospitalResults(hospitals, location, insuranceName) {
+    if (!hospitals.length) {
+        const fallback = `https://www.google.com/maps/search/hospitals+near+${encodeURIComponent(location)}`;
+        return (
+            `⚠️ No providers found within 15 miles of *${location}*.\n\n` +
+            `Try searching directly:\n<${fallback}|🗺️ Hospitals near ${location} — Google Maps>`
+        );
     }
-    const { data } = await api.post(`/chat/sessions/${sessionId}/messages`, { message: text });
-    const rawReply = data.message || data.response || JSON.stringify(data);
+
+    const typeEmoji = { hospital: '🏥', clinic: '🏨', urgent_care: '🚑', dentist: '🦷' };
+
+    let reply = `🏥 *Healthcare Providers near ${location}*\n`;
+    reply += insuranceName
+        ? `_Showing nearest results — call ahead to verify *${insuranceName}* is accepted_\n\n`
+        : '\n';
+
+    hospitals.forEach((h, i) => {
+        const icon = typeEmoji[h.type] || '🏥';
+        const q    = encodeURIComponent(`${h.name} ${h.addr || location}`);
+        const mapUrl = (h.lat && h.lng)
+            ? `https://www.google.com/maps/search/?api=1&query=${q}`
+            : `https://www.google.com/maps/search/${q}`;
+        reply += `${NUM_EMOJIS[i] || `${i + 1}.`} ${icon} *${h.name}*\n`;
+        if (h.addr) reply += `   📍 ${h.addr}\n`;
+        reply += `   <${mapUrl}|View on Google Maps>\n\n`;
+    });
+
+    if (insuranceName) {
+        reply += `_⚠️ Always confirm *${insuranceName}* in-network status before your visit._`;
+    }
+    return reply;
+}
+
+async function handleProviderSearch(userId, text, profile) {
+    const location      = profile.location;
+    const insuranceName = profile.insuranceName || '';
+    const wantsDentist  = /dentist|dental/i.test(text);
+    const radiusMeters  = 15000; // ~9 miles
+
+    try {
+        const hospitals = await searchNearbyHospitals(location, radiusMeters, wantsDentist ? 'dentist' : null);
+        return formatHospitalResults(hospitals, location, insuranceName);
+    } catch (err) {
+        console.error('[hospital-search]', err.message);
+        const fallback = `https://www.google.com/maps/search/hospitals+near+${encodeURIComponent(location)}`;
+        return (
+            `⚠️ Couldn't fetch live results right now (${err.message}).\n\n` +
+            `Search directly: <${fallback}|🗺️ Hospitals near ${location} — Google Maps>`
+        );
+    }
+}
+
+async function handleRagChat(userId, text) {
+    const policyId   = await resolvePolicyId(userId);
+    const profile    = getProfile(userId);
+    const lastBill   = state[`${userId}_lastBill`] || {};
+    const userCtx    = buildUserContext(profile, lastBill);
+
+    // Helper: send a message on a known sessionId
+    async function sendMessage(sid) {
+        return api.post(`/chat/sessions/${sid}/messages`, {
+            message:      text,
+            user_context: userCtx,
+        });
+    }
+
+    // Create a session if we don't have one
+    async function newSession() {
+        const { data } = await api.post('/chat/sessions', { document_ids: [policyId] });
+        const sid = data.session_id;
+        state[`${userId}_session`] = sid;
+        saveState(state);
+        return sid;
+    }
+
+    let sessionId = state[`${userId}_session`];
+    if (!sessionId) sessionId = await newSession();
+
+    let response;
+    try {
+        response = await sendMessage(sessionId);
+    } catch (err) {
+        // Stale session (backend restarted, SQLite lost it) — create a new one and retry
+        if (err.response?.status >= 400 && err.response?.status < 500) {
+            console.log(`[rag] stale session ${sessionId} (${err.response.status}), creating new session`);
+            sessionId = await newSession();
+            response  = await sendMessage(sessionId);
+        } else {
+            throw err;
+        }
+    }
+
+    const rawReply = response.data.message || response.data.response || JSON.stringify(response.data);
     bgB(userId, b => b.after(rawReply, { source: 'heal_chat' }));
     return `🧠 *HEAL:*\n\n${rawReply}`;
 }
