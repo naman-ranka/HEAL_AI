@@ -43,14 +43,19 @@ class GeminiEmbedder:
     def __init__(self,
                  model_name: str = "gemini-embedding-2-preview",
                  dimension: int = 768,
-                 enable_fallback: bool = True):
+                 enable_fallback: bool = False):
         """
         Initialize the Gemini embedder
-        
+
         Args:
             model_name: Gemini embedding model to use
             dimension: Expected embedding dimension
-            enable_fallback: Whether to use hash fallback on API failure
+            enable_fallback: Whether to use hash fallback on API failure.
+                Default False on purpose: a hash "embedding" is 768-dim noise
+                that passes the dimension guard and silently corrupts retrieval
+                (it ranks as garbage but looks successful). With fallback off,
+                a failed embed is reported as success=False so the caller can
+                skip storing it rather than poisoning the index.
         """
         self.model_name = model_name
         self.dimension = dimension
@@ -331,7 +336,7 @@ def get_embedder() -> GeminiEmbedder:
 
 def initialize_embedder(model_name: str = "gemini-embedding-2-preview",
                        dimension: int = 768,
-                       enable_fallback: bool = True) -> GeminiEmbedder:
+                       enable_fallback: bool = False) -> GeminiEmbedder:
     """Initialize the global embedder with custom settings"""
     global _embedder
     _embedder = GeminiEmbedder(model_name, dimension, enable_fallback)

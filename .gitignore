@@ -321,3 +321,6 @@ dist/
 # Documentation builds
 docs/build/
 site/
+
+# Internal planning/review doc — keep local, do not publish
+docs/UPGRADE_PLAN.md

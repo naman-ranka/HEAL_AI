@@ -37,6 +37,10 @@ class RetrievalResult:
     total_found: int
     execution_time_ms: int
     query_embedding: Optional[np.ndarray] = None
+    # Set when retrieval failed (e.g. embedding API error). Lets callers tell
+    # "no relevant context" (chunks empty, error None) apart from "the lookup
+    # broke" (error set) instead of silently treating both as empty.
+    error: Optional[str] = None
 
 class RAGRetriever:
     """Handles retrieval of relevant document chunks for queries"""
@@ -152,55 +156,37 @@ class RAGRetriever:
                 query=query,
                 chunks=[],
                 total_found=0,
-                execution_time_ms=execution_time
+                execution_time_ms=execution_time,
+                error=str(e)
             )
     
     async def _generate_query_embedding(self, query: str) -> np.ndarray:
-        """Generate embedding for query text using real Gemini embeddings"""
+        """Generate embedding for query text using real Gemini embeddings.
+
+        Raises on failure instead of returning a hash vector. A hash "embedding"
+        matches nothing meaningfully yet still looks like a successful result,
+        so retrieval would silently return irrelevant chunks. Failing here lets
+        retrieve() report an honest error the chatbot can surface to the user.
+        """
         logger.debug(f"🔍 Generating query embedding for: {query[:50]}...")
-        
-        try:
-            embedder = get_embedder()
-            
-            # Generate real semantic embedding for query
-            embedding_result = await embedder.embed_text(
-                text=query,
-                task_type=EmbeddingTaskType.RETRIEVAL_QUERY
-            )
-            
-            if embedding_result.success:
-                logger.debug(f"✅ Generated {embedding_result.model_used} query embedding in {embedding_result.execution_time_ms}ms")
-                return embedding_result.embedding
-            else:
-                logger.warning(f"⚠️ Query embedding failed: {embedding_result.error_message}")
-                return self._create_simple_embedding(query)
-                
-        except Exception as e:
-            logger.error(f"❌ Error generating query embedding: {e}")
-            return self._create_simple_embedding(query)
-    
-    def _create_simple_embedding(self, text: str, dim: int = 768) -> np.ndarray:
-        """Create a simple hash-based embedding as fallback"""
-        import hashlib
-        hash_obj = hashlib.md5(text.lower().encode())  # Lowercase for consistency
-        hash_bytes = hash_obj.digest()
-        
-        # Convert to float array and normalize
-        embedding = np.frombuffer(hash_bytes, dtype=np.uint8).astype(np.float32)
-        
-        # Pad or truncate to desired dimension
-        if len(embedding) < dim:
-            embedding = np.pad(embedding, (0, dim - len(embedding)))
-        else:
-            embedding = embedding[:dim]
-        
-        # Normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-        
-        return embedding
-    
+
+        embedder = get_embedder()
+
+        # Generate real semantic embedding for query
+        embedding_result = await embedder.embed_text(
+            text=query,
+            task_type=EmbeddingTaskType.RETRIEVAL_QUERY
+        )
+
+        if embedding_result.success:
+            logger.debug(f"✅ Generated {embedding_result.model_used} query embedding in {embedding_result.execution_time_ms}ms")
+            return embedding_result.embedding
+
+        # Fail loud — do not fall back to a meaningless hash vector.
+        raise RuntimeError(
+            f"Query embedding failed: {embedding_result.error_message or 'unknown error'}"
+        )
+
     def _get_chunks_with_embeddings(self, document_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         """Get chunks with their embeddings from database"""
         conn = get_db_connection()

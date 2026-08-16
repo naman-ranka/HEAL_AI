@@ -35,7 +35,7 @@ except ImportError as e:
 # Import RAG system with error handling
 try:
     from rag import DocumentProcessor, RAGRetriever, InsuranceChatbot
-    from database import create_rag_tables
+    from database import create_rag_tables, get_db_path
     from ai.embedder import get_embedder
     RAG_IMPORTS_SUCCESS = True
 except ImportError as e:
@@ -47,6 +47,7 @@ except ImportError as e:
     InsuranceChatbot = None
     def create_rag_tables(): pass
     def get_embedder(): return None
+    def get_db_path(): return os.environ.get("DB_PATH", "heal.db")
 
 # Load environment variables
 load_dotenv()
@@ -54,6 +55,44 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _validate_startup_config() -> None:
+    """Fail loud on misconfiguration instead of silently serving mock data.
+
+    Without GEMINI_API_KEY the app can still return plausible-looking *fake*
+    analysis (see the "MOCK DATA" paths below). That is an onboarding trap: a
+    reviewer thinks it works, or thinks the AI is bad. So by default we refuse
+    to start without a real key. Set ALLOW_MOCK=1 to run in mock mode anyway
+    (useful for frontend-only work), and we log a loud banner on every startup.
+    """
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    placeholders = {"", "your_gemini_api_key_here", "your-gemini-api-key-here"}
+    allow_mock = (os.environ.get("ALLOW_MOCK") or "").strip().lower() in {"1", "true", "yes"}
+
+    if key in placeholders:
+        banner = (
+            "\n" + "=" * 68 + "\n"
+            "  GEMINI_API_KEY is not set.\n"
+            "  All AI analysis (policy extraction, bill checking, RAG chat) will\n"
+            "  return FAKE mock data, not real results.\n"
+            "  Get a key: https://aistudio.google.com  ->  set GEMINI_API_KEY in .env\n"
+            + "=" * 68
+        )
+        if allow_mock:
+            logger.warning(banner)
+            logger.warning("ALLOW_MOCK is on -> starting in MOCK MODE (fake AI output).")
+        else:
+            logger.error(banner)
+            raise SystemExit(
+                "Refusing to start without GEMINI_API_KEY. "
+                "Set the key, or set ALLOW_MOCK=1 to run with fake data."
+            )
+    else:
+        logger.info("GEMINI_API_KEY detected -> real AI mode.")
+
+
+_validate_startup_config()
 
 app = FastAPI(
     title="HEAL API - AI Powered",
@@ -114,7 +153,7 @@ else:
 
 # Initialize database
 def init_db():
-    conn = sqlite3.connect("heal.db")
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS policies (
@@ -436,7 +475,7 @@ def save_to_database(data: Dict[str, Any]) -> None:
         data: Analysis result to save
     """
     try:
-        conn = sqlite3.connect("heal.db")
+        conn = sqlite3.connect(get_db_path())
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO policies (summary_json) VALUES (?)",
@@ -501,7 +540,7 @@ async def health_check():
         # Try database connection but don't fail if it doesn't work
         database_status = "unknown"
         try:
-            conn = sqlite3.connect("heal.db")
+            conn = sqlite3.connect(get_db_path())
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             conn.close()
@@ -599,6 +638,8 @@ async def send_chat_message(session_id: str, request: Dict[str, Any]) -> Dict[st
             "message": response.message,
             "sources": response.sources,
             "confidence": response.confidence,
+            "grounded": response.grounded,
+            "groundedness_note": response.groundedness_note,
             "processing_time_ms": response.processing_time_ms,
             "session_id": response.session_id
         }
@@ -743,7 +784,7 @@ async def contextual_chat(request: Request):
             logger.warning(f"RAG retrieval failed for contextual chat: {_e}")
             # Fallback: grab raw text (wider window now)
             try:
-                conn = sqlite3.connect("heal.db")
+                conn = sqlite3.connect(get_db_path())
                 cursor = conn.cursor()
                 cursor.execute("SELECT extracted_text FROM documents WHERE id = ?", (policy_id,))
                 row = cursor.fetchone()
@@ -959,7 +1000,7 @@ def save_to_database(data: Dict[str, Any]) -> None:
         data: Analysis result to save
     """
     try:
-        conn = sqlite3.connect("heal.db")
+        conn = sqlite3.connect(get_db_path())
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO policies (summary_json) VALUES (?)",
@@ -1516,7 +1557,7 @@ async def analyze_bill_async_start(request: Request):
 
     async def _run():
         try:
-            conn = sqlite3.connect("heal.db")
+            conn = sqlite3.connect(get_db_path())
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -2388,7 +2429,7 @@ async def perform_complete_reset() -> Dict[str, Any]:
         conn.commit()
         
         # Clean up uploaded files
-        uploads_dir = "uploads"
+        uploads_dir = os.environ.get("UPLOAD_DIR", "uploads")
         if os.path.exists(uploads_dir):
             file_count = sum(len(files) for _, _, files in os.walk(uploads_dir))
             reset_stats["files_deleted"] = file_count
@@ -2430,7 +2471,7 @@ async def get_database_stats() -> Dict[str, Any]:
                 stats[f"{table}_count"] = "N/A"
         
         # File system stats
-        uploads_dir = "uploads"
+        uploads_dir = os.environ.get("UPLOAD_DIR", "uploads")
         if os.path.exists(uploads_dir):
             file_count = sum(len(files) for _, _, files in os.walk(uploads_dir))
             total_size = sum(

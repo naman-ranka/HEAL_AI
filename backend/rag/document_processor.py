@@ -51,8 +51,10 @@ class DocumentChunk:
 class DocumentProcessor:
     """Handles document processing for RAG system"""
     
-    def __init__(self, upload_dir: str = "uploads"):
-        self.upload_dir = Path(upload_dir)
+    def __init__(self, upload_dir: str = None):
+        # UPLOAD_DIR lets deployments point originals at a persistent volume
+        # (Railway's default filesystem is ephemeral). Defaults to ./uploads.
+        self.upload_dir = Path(upload_dir or os.getenv("UPLOAD_DIR", "uploads"))
         self.upload_dir.mkdir(exist_ok=True)
     
     async def process_uploaded_file(
@@ -307,29 +309,6 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"❌ Error processing chunks for document {document_id}: {e}")
             raise
-    
-    def _create_simple_embedding(self, text: str, dim: int = 768) -> np.ndarray:
-        """Create a simple hash-based embedding as fallback"""
-        # Simple hash-based embedding for development
-        import hashlib
-        hash_obj = hashlib.md5(text.encode())
-        hash_bytes = hash_obj.digest()
-        
-        # Convert to float array and normalize
-        embedding = np.frombuffer(hash_bytes, dtype=np.uint8).astype(np.float32)
-        
-        # Pad or truncate to desired dimension
-        if len(embedding) < dim:
-            embedding = np.pad(embedding, (0, dim - len(embedding)))
-        else:
-            embedding = embedding[:dim]
-        
-        # Normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-        
-        return embedding
     
     def _store_document_metadata(
         self, 

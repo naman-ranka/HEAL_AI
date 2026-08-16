@@ -34,10 +34,11 @@ frontend-clean/            ← React + TypeScript + Vite frontend
 
 ### Backend Stack
 - **FastAPI** — main API server (`backend/main.py`)
-- **Google Gemini** — `text-embedding-004` for embeddings (768-dim), `gemini-2.5-flash/pro` for analysis
+- **Google Gemini** — `gemini-embedding-2-preview` for embeddings (768-dim, via hand-rolled v1beta REST), `gemini-2.5-flash/pro` for analysis
 - **SQLite** — local DB (`backend/heal.db`)
 - **RAG pipeline** — `backend/rag/` (document_processor → embedder → retriever → chatbot)
-- **google-generativeai==0.4.0** — do NOT upgrade without testing; use `text-embedding-004` (`embedding-001` was deprecated from v1beta API in 2025)
+- **Embedding model = `gemini-embedding-2-preview`** — the live default in `ai/embedder.py:44` and `:332`. `text-embedding-004` appears ONLY in dead files (`genkit_rag_chat.py`, `langchain_main.py`) that the live `rag/` path never imports; don't "restore" it — the stored vectors are in the preview model's space (same 768 dim, different space, and the dim guard won't catch a swap).
+- **google-generativeai==0.4.0** — do NOT upgrade without testing (newer `google-genai` has breaking changes)
 
 ### Slack Bot Stack
 - `@slack/bolt` v4 — socket mode
@@ -92,7 +93,7 @@ All bugs resolved. Current state of `heal-slack-bot/app.js`:
 - `beliefs.search()` used in `resolvePolicyId()` for state recovery after restart ✓
 - `beliefs.before()` removed (was unused) ✓
 - `document_processor.py` fallback dim is 768 ✓
-- `embedder.py:303` `initialize_embedder` default fixed to `text-embedding-004` ✓
+- `embedder.py` `initialize_embedder` + constructor default to `gemini-embedding-2-preview` (768-dim) ✓
 - State persisted to `bot-state.json` via `state.js` (survives restarts) ✓
 - `docId = 'latest'` fallback removed — throws if ID can't be determined ✓
 - Beliefs `after()` receives clean AI text, not Slack-formatted string ✓
@@ -145,7 +146,7 @@ node app.js
 
 ## Important Constraints
 - Do NOT upgrade `google-generativeai` from 0.4.0 without testing — newer SDK is `google-genai` and has breaking changes
-- Embedding model is `text-embedding-004` — `embedding-001` was deprecated from v1beta API in 2025; both return 768-dim vectors
+- Embedding model is `gemini-embedding-2-preview` (768-dim), called via a hand-rolled v1beta REST POST in `ai/embedder.py`. Do NOT swap the model without re-embedding every stored chunk — vectors from a different model share the 768 dim but not the space, and the dimension guard in `retriever.py` won't catch it
 - All embedding dimensions must be 768 everywhere — mismatches cause silent RAG failures
 - Keep `fallbackBeliefsState` in the Slack bot as a backup when Thinkn SDK throws `BetaAccessError`
 - The `beliefs` SDK may throw `BetaAccessError` with `err.code === 'BETA_ACCESS_REQUIRED'` — always wrap in try/catch
