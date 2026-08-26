@@ -185,7 +185,7 @@ async def analyze_insurance_policy(input_data: PolicyAnalysisInput) -> PolicyAna
             full_prompt = f"{analysis_prompt}\n\nExtracted Text:\n{extracted_text}"
             
             # Get model and generate response
-            model = ai_config.get_model('pro')  # Use Pro for complex text analysis
+            model = ai_config.get_model('flash')  # Use Pro for complex text analysis
             logger.info("🤖 Using Gemini Pro model for PDF text analysis")
             logger.info(f"📝 Sending combined prompt to Gemini (length: {len(full_prompt)} chars)")
             
@@ -292,7 +292,7 @@ async def summarize_policy_document(input_data: PolicyAnalysisInput) -> Dict[str
             extracted_text = _extract_pdf_text(pdf_data)
             full_prompt = f"{summary_prompt}\n\nDocument Content:\n{extracted_text}"
             
-            model = ai_config.get_model('pro')
+            model = ai_config.get_model('flash')
             response = model.generate_content(full_prompt)
         
         return {

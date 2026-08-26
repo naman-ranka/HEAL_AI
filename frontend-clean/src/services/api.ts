@@ -1,7 +1,10 @@
 // API Service Layer for HEAL.AI Frontend
-const API_BASE_URL = process.env.NODE_ENV === 'production' 
-  ? '' // Use same origin in production (Railway)
-  : 'http://localhost:8000'; // Use localhost in development
+// Configurable via VITE_API_BASE_URL (see .env.example) so you can point a local
+// frontend at a deployed backend without editing source. Falls back to same-origin
+// in a production build (Railway serves the SPA + API together) and localhost in dev.
+const API_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
+  (import.meta.env.PROD ? '' : 'http://localhost:8000');
 
 // Types for API responses
 export interface PolicyAnalysisResponse {

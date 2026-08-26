@@ -21,7 +21,8 @@ class AIConfig:
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.models = {
             'flash': 'gemini-2.5-flash',  # Fast model for images and text
-            'pro': 'gemini-2.5-pro'       # Pro model for complex analysis
+            'pro': 'gemini-2.5-pro',      # Pro model for complex analysis
+            'lite': 'gemini-1.5-flash',   # Lightweight — better free tier availability
         }
         
         # Safety settings

@@ -2,15 +2,28 @@
 Database schema for HEAL RAG system
 """
 
+import os
 import sqlite3
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-def create_rag_tables(db_path: str = "heal.db"):
+
+def get_db_path() -> str:
+    """Single source of truth for the SQLite file location.
+
+    Reads DB_PATH so deployments on an ephemeral filesystem (e.g. Railway) can
+    point it at a mounted persistent volume — otherwise every redeploy starts
+    from an empty database. Defaults to a local "heal.db" for dev.
+    """
+    return os.getenv("DB_PATH", "heal.db")
+
+
+def create_rag_tables(db_path: str = None):
     """Create all tables for RAG system"""
-    
+    db_path = db_path or get_db_path()
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -130,8 +143,9 @@ def create_rag_tables(db_path: str = "heal.db"):
     finally:
         conn.close()
 
-def get_db_connection(db_path: str = "heal.db") -> sqlite3.Connection:
+def get_db_connection(db_path: str = None) -> sqlite3.Connection:
     """Get database connection with proper configuration"""
+    db_path = db_path or get_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row  # Enable column access by name
     return conn

@@ -1,147 +1,103 @@
-# 🚀 HEAL.AI Deployment Guide
+# 🚀 HEAL.AI Deployment Guide (Railway)
 
-## Quick Deploy Options (Choose One)
+One Railway service runs everything: the Docker image builds the React frontend
+into `./static` and FastAPI serves it same-origin, so the SPA and API share one
+URL. The Slack bot, if you want it, is a separate service (see the end).
 
-### 1. 🚂 Railway (Recommended - Easiest)
+## ⚠️ Read this first: Railway's filesystem is ephemeral
 
-**One-command deployment:**
+Railway wipes the container filesystem on **every redeploy**. HEAL stores its
+database (`heal.db`) and uploaded files on disk. Without a persistent volume,
+**all policies, chunks, chat history, and bills are lost on each deploy.**
 
-```bash
-# Install Railway CLI
-npm install -g @railway/cli
+The app now reads two env vars so you can point storage at a mounted volume:
 
-# Login and deploy
-railway login
-railway init
-railway up
-```
+| Env var | Purpose | Volume value |
+|---------|---------|--------------|
+| `DB_PATH` | SQLite file location | `/data/heal.db` |
+| `UPLOAD_DIR` | Uploaded originals | `/data/uploads` |
 
-**Steps:**
-1. Push your code to GitHub
-2. Connect Railway to your GitHub repo
-3. Set `GEMINI_API_KEY` environment variable
-4. Railway automatically builds and deploys!
-
-**URL**: Your app will be available at `https://your-app.railway.app`
+If you skip the volume, the app still runs — it just forgets everything on redeploy.
 
 ---
 
-### 2. ☁️ Render (Also Super Easy)
+## Deploy steps
 
-**Steps:**
-1. Push code to GitHub
-2. Connect Render to your repo
-3. Render auto-detects the `render.yaml` config
-4. Set `GEMINI_API_KEY` in environment variables
-5. Deploy!
+1. **Push your code to your GitHub repo** (see the "Publish" section below).
 
-**URL**: Your app will be available at `https://your-app.onrender.com`
+2. **Create the Railway project** → New Project → Deploy from GitHub repo → pick
+   your `HEAL_AI` repo. Railway reads `railway.json` (Dockerfile build, `python main.py`,
+   health check at `/health`).
 
----
+3. **Add a persistent volume** → service → Settings → Volumes → add one mounted at
+   `/data`. (This is the step that prevents data loss.)
 
-### 3. 🐳 Docker (Local/VPS)
+4. **Set environment variables** (service → Variables):
+   ```env
+   GEMINI_API_KEY=your-real-key      # REQUIRED — app refuses to boot without it
+   ENVIRONMENT=production
+   DB_PATH=/data/heal.db
+   UPLOAD_DIR=/data/uploads
+   ```
+   > The backend fails fast if `GEMINI_API_KEY` is missing (no silent mock data).
+   > To run a keyless build on purpose, set `ALLOW_MOCK=1`.
 
-**For local testing:**
-```bash
-# Build and run
-docker-compose up --build
+5. **Deploy.** Railway builds the Dockerfile and starts the service. First boot
+   creates the tables under `/data`.
 
-# Access at http://localhost:8000
-```
-
-**For VPS deployment:**
-```bash
-# On your server
-git clone your-repo
-cd HEAL
-docker-compose up -d --build
-```
+6. **Verify** (see checklist below).
 
 ---
 
-### 4. 🌐 Vercel + Railway Split
+## 💸 Protect your wallet and the demo
 
-**Frontend (Vercel):**
-```bash
-cd frontend
-npx vercel --prod
-```
+The backend has **no auth** and holds your paid `GEMINI_API_KEY`. A leaked demo
+URL can drain your quota. Before sharing the link:
 
-**Backend (Railway):**
-```bash
-cd backend
-railway init
-railway up
-```
-
-Then update frontend API URL to point to Railway backend.
+- **Set a spend cap** in Google AI Studio / Cloud billing for the Gemini key.
+- Consider a lightweight rate limit or a shared demo password if the link goes public.
+- Railway hobby services **cold-start** after idle (first request hangs ~10–30s).
+  For an interview window, keep it warm by pinging `/health`, or run an always-on plan.
+- Expired Gemini/Slack tokens silently break the demo — check `/health` the morning of.
 
 ---
 
-## Environment Variables Needed
+## Post-deployment checklist
 
-For any deployment, set these environment variables:
+- [ ] `https://<app>.up.railway.app/health` returns healthy
+- [ ] `https://<app>.up.railway.app/docs` loads
+- [ ] The web app loads at the root URL
+- [ ] Upload `backend/sample_data/sample_policy.pdf` → coverage extracted
+- [ ] Bill-check `sample_bill_overcharged.pdf` → 3 errors flagged, dispute drafts
+- [ ] Redeploy once, confirm the uploaded policy is **still there** (volume works)
 
-```env
-GEMINI_API_KEY=your_gemini_api_key_here
-ENVIRONMENT=production
+---
+
+## Local Docker (optional)
+
+```bash
+docker compose up --build      # http://localhost:8000  (set GEMINI_API_KEY first)
 ```
 
 ---
 
-## Post-Deployment Checklist
+## Slack bot (optional, separate service)
 
-- [ ] Test health endpoint: `https://your-app.com/health`
-- [ ] Test API docs: `https://your-app.com/docs`
-- [ ] Upload test insurance document
-- [ ] Try chat functionality
-- [ ] Test bill analysis feature
+Socket-mode, no inbound port. New Railway service from the same repo with root
+directory `heal-slack-bot/`, start command `node app.js`, and env vars
+`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `HEAL_BACKEND_URL` (= your deployed backend
+URL), `BELIEFS_KEY`. See [`heal-slack-bot/README.md`](heal-slack-bot/README.md)
+for the Slack app setup.
 
 ---
 
 ## Troubleshooting
 
-**Common Issues:**
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Service exits immediately | `GEMINI_API_KEY` unset | Set it, or `ALLOW_MOCK=1` |
+| Data gone after redeploy | No volume / `DB_PATH` not on mount | Add `/data` volume, set `DB_PATH`/`UPLOAD_DIR` |
+| OCR fails on images | tesseract missing | Provided by the Dockerfile; use the Docker build |
+| First request hangs | cold start | keep-warm ping on `/health` or always-on plan |
 
-1. **Build fails**: Check that all dependencies are in requirements.txt
-2. **Frontend not loading**: Ensure static files are served correctly
-3. **API errors**: Verify GEMINI_API_KEY is set correctly
-4. **Database issues**: Check file permissions for SQLite
-
-**Logs:**
-- Railway: `railway logs`
-- Render: Check dashboard logs
-- Docker: `docker-compose logs`
-
----
-
-## Scaling Options
-
-**Free Tiers:**
-- Railway: 500 hours/month
-- Render: 750 hours/month
-- Vercel: Unlimited static hosting
-
-**Paid Upgrades:**
-- Railway: $5/month for always-on
-- Render: $7/month for always-on
-- VPS: $5-20/month depending on specs
-
----
-
-## Security Notes
-
-- ✅ HTTPS automatically enabled on Railway/Render
-- ✅ Environment variables encrypted
-- ✅ Database files persistent
-- ⚠️ Consider adding authentication for production use
-- ⚠️ Set up proper backup strategy for database
-
----
-
-## Performance Tips
-
-- Use Railway/Render for simplicity
-- Consider CDN for static assets in production
-- Monitor usage and upgrade plans as needed
-- Set up health monitoring alerts
+Logs: `railway logs`.

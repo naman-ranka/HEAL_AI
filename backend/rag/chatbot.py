@@ -4,9 +4,10 @@ RAG-powered chatbot for insurance policy questions
 
 import logging
 import json
+import re
 import uuid
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,6 +36,10 @@ class ChatResponse:
     processing_time_ms: int
     model_used: str
     tokens_used: Optional[int] = None
+    # Groundedness: did the answer stay within the retrieved sources?
+    # grounded=False means the post-generation check flagged an unsupported claim.
+    grounded: Optional[bool] = None
+    groundedness_note: Optional[str] = None
 
 class InsuranceChatbot:
     """RAG-powered chatbot for insurance policy questions"""
@@ -66,19 +71,21 @@ class InsuranceChatbot:
             conn.close()
     
     async def chat(
-        self, 
-        message: str, 
+        self,
+        message: str,
         session_id: str,
-        context_limit: int = 5
+        context_limit: int = 5,
+        user_context: str = "",
     ) -> ChatResponse:
         """
         Process a chat message and return AI response with RAG context
-        
+
         Args:
             message: User's message
             session_id: Chat session ID
             context_limit: Number of relevant chunks to retrieve
-            
+            user_context: Optional pre-built profile string (insurance, conditions, bill history)
+
         Returns:
             ChatResponse with AI-generated answer
         """
@@ -99,30 +106,60 @@ class InsuranceChatbot:
                 similarity_threshold=0.3,  # Lower threshold for more permissive matching
                 document_ids=document_ids
             )
-            
-            # Get policy summary for additional context
-            policy_summary = await self._get_policy_summary(document_ids)
-            
+
+            # Fail loud on a real retrieval error (e.g. embedding API down) rather
+            # than pretending we found no relevant policy info — the two mean very
+            # different things to the user.
+            if retrieval_result.error:
+                processing_time = int((time.time() - start_time) * 1000)
+                return ChatResponse(
+                    message=(
+                        "I couldn't reach the AI service to look through your "
+                        "documents just now. Please try again in a moment."
+                    ),
+                    sources=[],
+                    confidence=0.0,
+                    session_id=session_id,
+                    processing_time_ms=processing_time,
+                    model_used='error',
+                    grounded=None,
+                    groundedness_note=f"retrieval error: {retrieval_result.error}",
+                )
+
+            # Get policy summary only when no rich user_context is available
+            # (user_context blob already contains insurance name, deductibles, copay etc.)
+            policy_summary = "" if user_context else await self._get_policy_summary(document_ids)
+
             # Build enhanced context from retrieved chunks and policy summary
             context = self._build_enhanced_context(retrieval_result.chunks, policy_summary)
             
             # Get conversation history for context
             conversation_history = self.get_chat_history(session_id, limit=10)
             
-            # Generate AI response with conversation context
+            # Generate AI response with conversation context + user profile
             ai_response = await self._generate_ai_response(
-                message, 
-                context, 
+                message,
+                context,
                 retrieval_result.chunks,
-                conversation_history
+                conversation_history,
+                user_context=user_context,
             )
             
             # Calculate confidence based on retrieval quality
             confidence = self._calculate_response_confidence(retrieval_result.chunks)
-            
+
+            # Post-generation groundedness check (deterministic, non-LLM)
+            grounded, groundedness_note = self._check_groundedness(
+                ai_response, retrieval_result.chunks
+            )
+            if not grounded:
+                logger.warning(
+                    f"⚠️ Groundedness flag (session {session_id}): {groundedness_note}"
+                )
+
             # Prepare sources information
             sources = self._prepare_sources(retrieval_result.chunks)
-            
+
             processing_time = int((time.time() - start_time) * 1000)
             
             # Save conversation to database
@@ -146,8 +183,10 @@ class InsuranceChatbot:
                 confidence=confidence,
                 session_id=session_id,
                 processing_time_ms=processing_time,
-                model_used='gemini-2.5-pro',
-                tokens_used=None  # Would be available in real Genkit implementation
+                model_used='gemini-2.5-flash',
+                tokens_used=None,  # Would be available in real Genkit implementation
+                grounded=grounded,
+                groundedness_note=groundedness_note,
             )
             
             logger.info(f"Generated chat response for session {session_id} in {processing_time}ms")
@@ -179,34 +218,39 @@ class InsuranceChatbot:
         return "\n\n".join(context_parts)
     
     def _build_enhanced_context(self, chunks: List[RetrievedChunk], policy_summary: str) -> str:
-        """Build enhanced context with policy summary and retrieved chunks"""
+        """Build enhanced context with policy summary and retrieved chunks.
+
+        Every source gets a stable citation tag ([S0] for the overview, [S1..N]
+        for retrieved sections) so the model can cite the exact source of each
+        fact and _prepare_sources can map those tags back to documents.
+        """
         context_parts = []
-        
+
         # Add policy summary first for overall context
         if policy_summary:
-            context_parts.append(f"[POLICY OVERVIEW]:\n{policy_summary}")
-        
-        # Add specific relevant chunks
+            context_parts.append(f"[S0 - Policy overview]:\n{policy_summary}")
+
+        # Add specific relevant chunks, each tagged for citation
         if chunks:
-            context_parts.append(f"[RELEVANT POLICY SECTIONS]:")
+            context_parts.append("RETRIEVED POLICY SECTIONS (cite each fact by its tag):")
             for i, chunk in enumerate(chunks, 1):
-                context_parts.append(f"Section {i} ({chunk.source_document}, similarity: {chunk.similarity_score:.3f}):\n{chunk.text}")
+                location = f"{chunk.source_document}, section {chunk.chunk_index}"
+                context_parts.append(f"[S{i} - {location}]:\n{chunk.text}")
         else:
-            context_parts.append("[RELEVANT POLICY SECTIONS]:\nNo specific sections found matching your query.")
-        
+            context_parts.append("RETRIEVED POLICY SECTIONS:\n(none matched this query)")
+
         return "\n\n".join(context_parts)
     
     async def _get_policy_summary(self, document_ids: Optional[List[int]] = None) -> str:
-        """Get policy summary from the most recent policy analysis"""
+        """Get policy summary from the database (scoped to most recent upload)"""
         try:
             conn = get_db_connection()
             try:
                 cursor = conn.cursor()
-                
-                # Get the most recent policy analysis result
+                # policies table has no document_id FK yet; ORDER BY id DESC gives the latest
                 cursor.execute("""
-                    SELECT summary_json FROM policies 
-                    ORDER BY id DESC 
+                    SELECT summary_json FROM policies
+                    ORDER BY id DESC
                     LIMIT 1
                 """)
                 
@@ -244,27 +288,26 @@ class InsuranceChatbot:
             return ""
     
     async def _generate_ai_response(
-        self, 
-        user_message: str, 
+        self,
+        user_message: str,
         context: str,
         chunks: List[RetrievedChunk],
-        conversation_history: List[Dict[str, Any]] = None
+        conversation_history: List[Dict[str, Any]] = None,
+        user_context: str = "",
     ) -> str:
         """Generate AI response using context"""
-        
+
         if not ai_config.is_available():
             return self._generate_fallback_response(user_message, chunks, conversation_history)
-        
+
         try:
-            # Build the prompt with context and conversation history
-            prompt = self._build_conversational_rag_prompt(user_message, context, conversation_history)
-            
-            # Generate response using Gemini
-            model = ai_config.get_model('pro')
+            prompt = self._build_conversational_rag_prompt(
+                user_message, context, conversation_history, user_context=user_context
+            )
+            model = ai_config.get_model('flash')
             response = model.generate_content(prompt)
-            
             return response.text
-            
+
         except Exception as e:
             logger.error(f"Error generating AI response: {e}")
             return self._generate_fallback_response(user_message, chunks, conversation_history)
@@ -308,9 +351,14 @@ USER QUESTION:
 YOUR RESPONSE (use markdown formatting):
 """
 
-    def _build_conversational_rag_prompt(self, user_message: str, context: str, conversation_history: List[Dict[str, Any]] = None) -> str:
-        """Build a conversational RAG prompt with chat history"""
-        
+    def _build_conversational_rag_prompt(self, user_message: str, context: str, conversation_history: List[Dict[str, Any]] = None, user_context: str = "") -> str:
+        """Build a conversational RAG prompt with chat history and user profile context"""
+
+        # Build user context block (insurance name, bill history, conditions, etc.)
+        user_context_block = ""
+        if user_context:
+            user_context_block = f"\nUSER PROFILE (known facts about this user):\n{user_context}\n"
+
         # Build conversation history string
         history_context = ""
         if conversation_history and len(conversation_history) > 0:
@@ -319,8 +367,16 @@ YOUR RESPONSE (use markdown formatting):
                 role = "User" if msg['message_type'] == 'user' else "HEAL"
                 history_context += f"{role}: {msg['content']}\n"
             history_context += "\n"
-        
+
         return f"""You are HEAL, an expert insurance policy assistant. You maintain conversational context and help users understand their insurance policies.
+You have access to the user's profile (insurance, conditions, bill history) and must use it to personalise every answer.
+When the user's insurance name, copay amounts, or bill findings are known, reference them directly instead of giving generic answers.
+
+GROUNDING RULES (critical — this is a financial/medical product, wrong numbers cause real harm):
+- Answer ONLY using the AVAILABLE POLICY INFORMATION and USER PROFILE below. Do not use outside knowledge, training data, or assumptions.
+- After every specific fact (a dollar amount, percentage, limit, or coverage claim), cite the source tag it came from, e.g. "Your specialist copay is $60 [S2]." Facts from the user profile are cited as [profile].
+- If the answer is not in the provided information, say exactly: "I don't have that in your uploaded documents." Then suggest contacting the insurer. NEVER invent or estimate a number.
+- Do not cite a tag that does not appear in the provided information.
 
 IMPORTANT FORMATTING RULES:
 - Use markdown formatting with **bold** for headers and - for bullet points
@@ -355,7 +411,7 @@ FORMAT YOUR RESPONSE LIKE THIS EXAMPLE:
 - [Practical implication]
 - [Action you might take]
 
-{history_context}AVAILABLE POLICY INFORMATION:
+{user_context_block}{history_context}AVAILABLE POLICY INFORMATION:
 {context}
 
 CURRENT USER QUESTION:
@@ -431,20 +487,56 @@ NEXT STEPS:
         return round(confidence, 2)
     
     def _prepare_sources(self, chunks: List[RetrievedChunk]) -> List[Dict[str, Any]]:
-        """Prepare source information for response"""
+        """Prepare source information for response.
+
+        The ``label`` (S1, S2, ...) matches the citation tags injected into the
+        prompt by _build_enhanced_context, so the frontend can turn an inline
+        [S1] in the answer into a link to this source.
+        """
         sources = []
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks, 1):
             # Fix undefined document names and NaN similarities
             document_name = chunk.source_document if chunk.source_document and chunk.source_document != "undefined" else "Policy Document"
             similarity = chunk.similarity_score if chunk.similarity_score and not str(chunk.similarity_score).lower() == 'nan' else 0.0
-            
+
             sources.append({
+                "label": f"S{i}",
                 "document": document_name,
+                "section": chunk.chunk_index,
                 "similarity": round(similarity, 3),
                 "preview": chunk.text[:150] + "..." if len(chunk.text) > 150 else chunk.text,
                 "chunk_id": chunk.chunk_id
             })
         return sources
+
+    def _check_groundedness(
+        self, answer: str, chunks: List[RetrievedChunk]
+    ) -> Tuple[bool, str]:
+        """Deterministic post-generation groundedness check.
+
+        Cheap and non-LLM (so it can't itself hallucinate and doesn't add cost
+        or latency to the hot path). It catches the failure mode that matters
+        most for a money product: stating a specific figure with no supporting
+        source. Returns (grounded, note).
+        """
+        text = answer or ""
+        lower = text.lower()
+
+        # The model explicitly declined to answer beyond the context — that's grounded.
+        if "don't have that" in lower or "do not have that" in lower:
+            return True, "Model declined to answer beyond the provided context."
+
+        has_citation = bool(re.search(r"\[S\d+\]|\[profile\]", text))
+        # A "specific claim" = a dollar amount or a percentage.
+        has_specific_claim = bool(re.search(r"\$\s?\d|\b\d+(\.\d+)?\s?%", text))
+
+        if has_specific_claim and not chunks:
+            return False, "States specific figures but no sources were retrieved."
+        if has_specific_claim and not has_citation:
+            return False, "States specific figures without citing a source."
+        if has_citation:
+            return True, "Specific claims cite retrieved sources."
+        return True, "No specific figures to verify."
     
     def _get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get session information from database"""
@@ -485,7 +577,7 @@ NEXT STEPS:
                 content,
                 json.dumps(relevant_chunks) if relevant_chunks else None,
                 confidence_score,
-                'gemini-2.5-pro' if message_type == 'assistant' else None,
+                'gemini-2.5-flash' if message_type == 'assistant' else None,
                 processing_time_ms
             ))
             conn.commit()
