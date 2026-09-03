@@ -183,7 +183,7 @@ class InsuranceChatbot:
                 confidence=confidence,
                 session_id=session_id,
                 processing_time_ms=processing_time,
-                model_used='gemini-2.5-flash',
+                model_used='gemini-3.6-flash',
                 tokens_used=None,  # Would be available in real Genkit implementation
                 grounded=grounded,
                 groundedness_note=groundedness_note,
@@ -577,7 +577,7 @@ NEXT STEPS:
                 content,
                 json.dumps(relevant_chunks) if relevant_chunks else None,
                 confidence_score,
-                'gemini-2.5-flash' if message_type == 'assistant' else None,
+                'gemini-3.6-flash' if message_type == 'assistant' else None,
                 processing_time_ms
             ))
             conn.commit()

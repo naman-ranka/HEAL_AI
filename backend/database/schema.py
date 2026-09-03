@@ -24,6 +24,13 @@ def create_rag_tables(db_path: str = None):
     """Create all tables for RAG system"""
     db_path = db_path or get_db_path()
 
+    # DB_PATH may point at a volume mount (e.g. /data/heal.db) whose parent
+    # dir doesn't exist yet on a fresh container — sqlite3.connect() won't
+    # create it and fails with "unable to open database file".
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -146,6 +153,9 @@ def create_rag_tables(db_path: str = None):
 def get_db_connection(db_path: str = None) -> sqlite3.Connection:
     """Get database connection with proper configuration"""
     db_path = db_path or get_db_path()
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row  # Enable column access by name
     return conn
