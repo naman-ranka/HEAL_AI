@@ -86,7 +86,7 @@ const BillSummaryCard: React.FC<BillSummaryCardProps> = ({ data, onFileDispute }
     id: index + 1,
     title: service.serviceDescription,
     code: service.serviceCode ? `CPT: ${service.serviceCode}` : "",
-    amount: service.patientOwed,
+    amount: service.patientOwed ?? 0,
     explanation: service.notes,
     breakdown: [
       ...(service.copay && service.copay > 0 ? [{ label: "Copay", amount: service.copay, description: "Fixed copay amount per your plan benefits." }] : []),
@@ -207,7 +207,7 @@ const BillSummaryCard: React.FC<BillSummaryCardProps> = ({ data, onFileDispute }
                   </div>
                   <div className="text-right">
                     <div className="text-xl font-bold text-red-600">
-                      You Owe: ${service.amount.toFixed(2)}
+                      You Owe: ${service.amount?.toFixed(2) || '0.00'}
                     </div>
                   </div>
                 </div>
@@ -222,7 +222,7 @@ const BillSummaryCard: React.FC<BillSummaryCardProps> = ({ data, onFileDispute }
                           <div className="flex-1">
                             <div className="flex items-center justify-between">
                               <span className="font-medium text-gray-800">{item.label}:</span>
-                              <span className="font-semibold text-gray-900">${item.amount.toFixed(2)}</span>
+                              <span className="font-semibold text-gray-900">${item.amount?.toFixed(2) || '0.00'}</span>
                             </div>
                             <p className="text-sm text-gray-600 mt-1">{item.description}</p>
                           </div>

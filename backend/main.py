@@ -1815,7 +1815,19 @@ def parse_json_bill_analysis(analysis_text: str) -> dict:
                     "amount_saved": totals.get("networkDiscount", totals.get("amountSaved", 0.0)),
                     "total_overcharge": discrepancy.get("totalOvercharge", 0.0),
                 },
-                "service_details": bill_summary.get("serviceDetails", []),
+                # Gemini's JSON output isn't guaranteed to include every numeric
+                # field for every line item — default the ones the frontend does
+                # unguarded arithmetic on (e.g. .toFixed()) so a partial extraction
+                # doesn't crash the details view.
+                "service_details": [
+                    {
+                        **detail,
+                        "providerBilled": detail.get("providerBilled") or 0.0,
+                        "planPaid": detail.get("planPaid") or 0.0,
+                        "patientOwed": detail.get("patientOwed") or 0.0,
+                    }
+                    for detail in bill_summary.get("serviceDetails", [])
+                ],
                 "dispute_recommendations": [
                     {
                         "issue_type": "Discrepancy Analysis",
