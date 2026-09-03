@@ -55,7 +55,9 @@ class DocumentProcessor:
         # UPLOAD_DIR lets deployments point originals at a persistent volume
         # (Railway's default filesystem is ephemeral). Defaults to ./uploads.
         self.upload_dir = Path(upload_dir or os.getenv("UPLOAD_DIR", "uploads"))
-        self.upload_dir.mkdir(exist_ok=True)
+        # parents=True: UPLOAD_DIR may point at a volume mount (e.g. /data/uploads)
+        # whose parent doesn't exist yet on a fresh container.
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
     
     async def process_uploaded_file(
         self, 

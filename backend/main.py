@@ -131,6 +131,18 @@ if AI_IMPORTS_SUCCESS:
 else:
     logger.warning("AI imports failed - using mock responses")
 
+# Ensure DB_PATH / UPLOAD_DIR parent dirs exist before anything tries to open
+# them. On Railway these point at a mounted volume (e.g. /data/heal.db,
+# /data/uploads); if the volume isn't attached/mounted where expected, this
+# still lets the app boot (into an ephemeral dir) instead of crash-looping.
+try:
+    _db_parent = os.path.dirname(os.environ.get("DB_PATH", "heal.db"))
+    if _db_parent:
+        os.makedirs(_db_parent, exist_ok=True)
+    os.makedirs(os.environ.get("UPLOAD_DIR", "uploads"), exist_ok=True)
+except Exception as _dir_err:
+    logger.error(f"Could not create data directories: {_dir_err}")
+
 # Initialize RAG components with error handling
 document_processor = None
 rag_retriever = None
@@ -1225,7 +1237,7 @@ async def debug_test_gemini(request: Dict[str, str]) -> Dict[str, Any]:
             "success": True,
             "prompt": test_prompt,
             "response": response.text,
-            "model_used": "gemini-2.5-flash",
+            "model_used": "gemini-3.6-flash",
             "response_time_ms": int((end_time - start_time) * 1000),
             "ai_config": {
                 "api_key_configured": True,

@@ -20,8 +20,10 @@ class AIConfig:
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.models = {
-            'flash': 'gemini-2.5-flash',  # Fast model for images and text
-            'pro': 'gemini-2.5-pro',      # Pro model for complex analysis
+            # gemini-2.5-flash/-pro were retired for new API keys (404: "no
+            # longer available to new users, use models/gemini-3.6-flash").
+            'flash': 'gemini-3.6-flash',  # Fast model for images and text
+            'pro': 'gemini-3.6-pro',      # Pro model for complex analysis
             'lite': 'gemini-1.5-flash',   # Lightweight — better free tier availability
         }
         
